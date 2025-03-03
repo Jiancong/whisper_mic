@@ -1,47 +1,98 @@
 import asyncio
 import websockets
-import soundfile as sf
+import sounddevice as sd
 import numpy as np
-import librosa
 import logging
+from queue import Queue
+import threading
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-async def test_whisper():
-    uri = "ws://localhost:8765"
-    try:
-        # 增加 ping_interval 和 ping_timeout
-        async with websockets.connect(
-            uri,
-            ping_interval=20,  # 每 20 秒发送一次 ping
-            ping_timeout=60    # 等待 60 秒超时
-        ) as websocket:
-            logger.info("✅ Connected to Whisper WebSocket Server!")
-            # 读取音频文件
-            data, samplerate = sf.read("./CTS-CN-F2F-2019-11-15-3.wav", dtype="float32")
-            if samplerate != 16000:
-                logger.warning(f"⚠️ Original samplerate {samplerate} != 16000, resampling to 16000 Hz.")
-                data = librosa.resample(data, orig_sr=samplerate, target_sr=16000)
-                samplerate = 16000
-            
-            chunk_size = 80000  # 5 seconds at 16000 Hz
-            for i in range(0, len(data), chunk_size):
-                chunk = data[i:i + chunk_size]
-                await websocket.send(chunk.tobytes())
-                logger.info(f"Sent chunk {i // chunk_size + 1} of {len(data) // chunk_size + 1}, size: {len(chunk)} samples")
-                await asyncio.sleep(0.1)  # 模拟实时流
-                
-                # 接收转录结果
+SAMPLE_RATE = 16000
+BLOCK_SIZE = 8000
+CHANNELS = 1
+DURATION = None
+
+class AudioWebSocketClient:
+    def __init__(self):
+        self.audio_queue = Queue()
+        self.running = False
+
+    def audio_callback(self, indata, frames, time, status):
+        """Audio callback function"""
+        if status:
+            logger.warning(f"Audio callback status: {status}")
+        audio_data = indata[:, 0].astype(np.float32)
+        self.audio_queue.put(audio_data)
+
+    async def send_audio(self, websocket):
+        """Send audio from queue to websocket"""
+        while self.running:
+            try:
+                audio_data = await asyncio.to_thread(self.audio_queue.get)
+                await websocket.send(audio_data.tobytes())
+                self.audio_queue.task_done()
+            except Exception as e:
+                logger.error(f"Send error: {e}")
+                break
+
+    async def receive_transcription(self, websocket):
+        """Receive transcription from websocket"""
+        while self.running:
+            try:
                 response = await websocket.recv()
                 if response.startswith("Error:"):
-                    logger.error(f"⚠️ Server error: {response}")
+                    logger.error(f"Server error: {response}")
                 else:
-                    logger.info(f"🎤 Transcription: {response}")
+                    logger.info(f"Transcription: {response}")
+            except Exception as e:
+                logger.error(f"Receive error: {e}")
+                break
+
+    def start_audio_stream(self):
+        """Start the audio input stream"""
+        return sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCK_SIZE,
+            channels=CHANNELS,
+            dtype='float32',
+            callback=self.audio_callback
+        )
+
+async def test_whisper():
+    uri = "ws://localhost:8765"
+    client = AudioWebSocketClient()
+    
+    try:
+        async with websockets.connect(
+            uri,
+            ping_interval=20,
+            ping_timeout=60
+        ) as websocket:
+            logger.info("✅ Connected to Whisper WebSocket Server!")
+            
+            # Start audio stream
+            client.running = True
+            with client.start_audio_stream():
+                logger.info("🎙️ Started microphone recording")
+                
+                # Create tasks for sending and receiving
+                send_task = asyncio.create_task(client.send_audio(websocket))
+                receive_task = asyncio.create_task(client.receive_transcription(websocket))
+                
+                # Wait for tasks to complete
+                if DURATION:
+                    await asyncio.wait([send_task, receive_task], timeout=DURATION)
+                else:
+                    await asyncio.gather(send_task, receive_task)
+                
     except ConnectionRefusedError:
         logger.error("❌ Failed to connect to server. Is it running?")
     except Exception as e:
         logger.error(f"❌ Unexpected error: {e}")
+    finally:
+        client.running = False
 
-# 运行测试
-asyncio.run(test_whisper())
+if __name__ == "__main__":
+    asyncio.run(test_whisper())
