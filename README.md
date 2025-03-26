@@ -18,7 +18,7 @@ python server.py
 
 ## Usage
 
-### ASR
+## ASR
 
 We use a Whisper model for ASR. It runs at  ### ASR
 
@@ -30,11 +30,11 @@ python server.py
 
 We use a Whisper model for ASR. It runs at  URL_ADDRESS:5000/transcribe
 
-### LLM with Ollama
+## LLM with Ollama
 We use a Ollama service for LLM inference. Make sure Ollama is running with the required LLM instance. 
 It runs at  http://localhost:11434/api/chat
 
-### TTS
+## TTS
 
 We use F5-TTS-main for TTS. It runs at  for TTS. It runs at  URL_ADDRESS:5000/generate
 
