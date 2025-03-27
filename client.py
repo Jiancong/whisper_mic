@@ -99,21 +99,7 @@ class AudioWebSocketClient:
                 except asyncio.TimeoutError:
                     continue
 
-                # 添加音频数据检查
-                if np.all(np.abs(audio_data) < 0.003):
-                    # 使用进度日志器记录静音消息
-                    self.progress_logger.log("WARNING", "检测到静音音频，跳过发送")
-                    self.audio_queue.task_done()
-                    continue
-                    
-                # 添加音频数据统计信息
-                max_amp = audio_data.max()
-                if max_amp > 0.05:  # 只在振幅较大时输出详细信息
-                    self.progress_logger.log("INFO", f"发送音频数据: {audio_data.size} 样本, 最小值: {audio_data.min():.4f}, 最大值: {audio_data.max():.4f}")
-                else:
-                    # 对于小振幅音频，使用简化消息
-                    self.progress_logger.log("INFO", f"发送音频数据: {audio_data.size} 样本 (低振幅)")
-
+                # 直接发送音频数据，不进行噪音检测和背景处理
                 await self.websocket.send(audio_data.tobytes())
                 
                 self.audio_queue.task_done()
