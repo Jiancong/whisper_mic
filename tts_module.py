@@ -75,6 +75,17 @@ class TTSProcessor:
             logger.error(f"发送音频文件错误: {e}")
             await websocket.send(f"Error: Could not send audio file {audio_file_path}")
             return False
+
+    # 修改音频发送部分，添加AUDIO:前缀
+    async def send_audio_with_prefix(self, websocket, audio_file_path):
+        """发送带AUDIO:前缀的音频数据"""
+        with open(audio_file_path, 'rb') as f:
+            audio_data = f.read()
+            # 添加base64编码
+            import base64
+            encoded_audio = base64.b64encode(audio_data).decode('utf-8')
+            await websocket.send(f"AUDIO:{encoded_audio}")   
+            return True         
     
     async def generate_all_questions_async(self, chat_function, conversation_history, start_counter, max_questions, tts_queue):
         """完全异步生成所有问题音频"""

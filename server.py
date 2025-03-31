@@ -123,7 +123,6 @@ async def process_audio(websocket, path):
     logger.info("Connected to client!")
     audio_buffer = np.array([], dtype=np.float32)
     question_counter = 1
-    is_playing_audio = False
     awaiting_response = False
     last_transcription_time = 0
     last_complete_transcription = ""  # 记录上一次完整转录结果
@@ -148,9 +147,8 @@ async def process_audio(websocket, path):
             return
 
         # Send the first question audio
-        await tts_processor.send_audio(websocket, QUESTION_1_FILE)
+        await tts_processor.send_audio_with_prefix(websocket, QUESTION_1_FILE)
         logger.info("Sent first question: Can you briefly introduce yourself?")
-        is_playing_audio = True
         awaiting_response = True
         question_counter += 1
 
@@ -183,44 +181,13 @@ async def process_audio(websocket, path):
                 # logger.info(f"收到客户端消息: {message}")
                 
                 # 只在收到非二进制数据或首次连接时输出详细日志
-                if isinstance(message, str) or audio_buffer.size == 0:
-                    logger.info(f"收到客户端消息，类型: {type(message)}")
-                
-                # Handle client playback status messages
-                if isinstance(message, str):
-                    if message == "playback_started":
-                        is_playing_audio = True
-                        logger.info("客户端开始播放音频")
-                        continue
-                    elif message == "playback_finished":
-                        logger.info("客户端完成音频播放")
-                        is_playing_audio = False
-                        continue
+                if isinstance(message, str) and message.startswith("AUDIO:"):
+                    hex_data = message[len("AUDIO:"):]
+                    audio_chunk = np.frombuffer(bytes.fromhex(hex_data), dtype=np.float32)
 
-                # Process audio input when no audio is playing
-                if not is_playing_audio:
-                    # 检查消息是否为二进制数据
-                    if not isinstance(message, bytes):
-                        logger.warning(f"收到非二进制数据: {message}")
-                        continue
-
-                    audio_chunk = np.frombuffer(message, dtype=np.float32)
                     if audio_chunk.size == 0:
                         logger.warning("收到空音频块")
                         continue
-
-                    # # 检测是否为有效音频（非静音）
-                    # is_silent = np.mean(np.abs(audio_chunk)) < SILENCE_THRESHOLD
-                    
-                    # if is_silent:
-                    #     silence_counter += 1
-                    #     # 每10个静音帧输出一次日志
-                    #     if silence_counter % 10 == 0:
-                    #         logger.debug(f"检测到静音帧 ({silence_counter})")
-                    # else:
-                    #     # 重置静音计数器并更新最后有效音频时间
-                    #     silence_counter = 0
-                    #     last_audio_time = time.time()
                     
                     # 使用ASR模块进行降噪，但保留更多原始信号
                     denoised_chunk = asr_processor.denoise_audio(audio_chunk)
@@ -273,18 +240,16 @@ async def process_audio(websocket, path):
                             try:
                                 next_audio_path, question_text = await asyncio.wait_for(tts_queue.get(), timeout=0.1)
                                 logger.info(f"使用队列中的下一个问题: {question_text}")
-                                await tts_processor.send_audio(websocket, next_audio_path)
+                                await tts_processor.send_audio_with_prefix(websocket, next_audio_path)
                                 logger.info(f"Sent next question: {next_audio_path}")
-                                is_playing_audio = True
                                 awaiting_response = True
                                 question_counter += 1
                             except (asyncio.QueueEmpty, asyncio.TimeoutError):
                                 # 如果队列为空，检查文件系统
                                 next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
                                 if os.path.exists(next_audio_path):
-                                    await tts_processor.send_audio(websocket, next_audio_path)
+                                    await tts_processor.send_audio_with_prefix(websocket, next_audio_path)
                                     logger.info(f"Sent next question from file: {next_audio_path}")
-                                    is_playing_audio = True
                                     awaiting_response = True
                                     question_counter += 1
                                 else:
@@ -302,8 +267,7 @@ async def process_audio(websocket, path):
                                 continue
                             
                             logger.info(f"Response too short ({len(transcription)} chars), sending more_details.wav")
-                            await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
-                            is_playing_audio = True
+                            await tts_processor.send_audio_with_prefix(websocket, MORE_DETAILS_FILE)
                             awaiting_response = True  # Continue awaiting a longer response
                             # 不清空音频缓冲区，保留已收集的音频
 
@@ -311,14 +275,14 @@ async def process_audio(websocket, path):
                 if time.time() - start_time > TIMEOUT_SECONDS:
                     logger.info("Timeout 111 : No sufficient response within 20 seconds.")
                     if os.path.exists(BYE_FILE):
-                        await tts_processor.send_audio(websocket, BYE_FILE)
+                        await tts_processor.send_audio_with_prefix(websocket, BYE_FILE)
                     await websocket.send("The interview is closed due to inactivity or insufficient response. Thanks!")
                     break
 
             except asyncio.TimeoutError:
                 logger.info("Timeout 222: No response within 20 seconds.")
                 if os.path.exists(BYE_FILE):
-                    await tts_processor.send_audio(websocket, BYE_FILE)
+                    await tts_processor.send_audio_with_prefix(websocket, BYE_FILE)
                 await websocket.send("The interview is closed due to inactivity. Thanks for your time!")
                 break
 
@@ -346,7 +310,14 @@ if __name__ == "__main__":
     observer.start()
 
     # Start WebSocket server
-    start_server = websockets.serve(process_audio, "0.0.0.0", 8765, max_size=10_000_000, ping_interval=30, ping_timeout=120)
+    start_server = websockets.serve(
+        process_audio, 
+        "0.0.0.0", 8765, 
+        max_size=10_000_000, 
+        ping_interval=30, 
+        ping_timeout=120
+    )
+
     logger.info("Whisper WebSocket server started on ws://localhost:8765")
     asyncio.get_event_loop().run_until_complete(start_server)
     asyncio.get_event_loop().run_forever()

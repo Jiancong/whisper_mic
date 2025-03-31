@@ -99,44 +99,51 @@ class AudioWebSocketClient:
                 except asyncio.TimeoutError:
                     continue
 
-                # 直接发送音频数据，不进行噪音检测和背景处理
-                await self.websocket.send(audio_data.tobytes())
+                # 添加AUDIO:前缀并发送
+                await self.websocket.send(
+                    f"AUDIO:{audio_data.tobytes().hex()}"
+                    )
                 
                 self.audio_queue.task_done()
             except Exception as e:
                 logger.error(f"Send error: {e}")
                 break
+    
+    async def play_audio(self, audio_data):
+        """Play audio from bytes"""
+        try:
+            # 如果收到的是带前缀的base64数据，需要先解码
+            if isinstance(audio_data, str):
+                import base64
+                audio_data = base64.b64decode(audio_data)
+                
+            # 将音频数据转换为numpy数组
+            audio_array = np.frombuffer(audio_data, dtype=np.float32)
+            
+            # 播放音频
+            sd.play(audio_array, samplerate=SAMPLE_RATE)
+            sd.wait()
+            
+        except Exception as e:
+            logger.error(f"Audio playback error: {e}")
 
     async def receive_and_play_audio(self):
         """Receive data from WebSocket and play audio if it's in bytes"""
         while self.running and self.websocket:
             try:
                 data = await self.websocket.recv()
-                if isinstance(data, bytes):
-                    # 通知服务器开始播放音频
-                    await self.websocket.send("playback_started")
-                    
-                    # Handle audio data (assumed to be WAV format)
-                    with io.BytesIO(data) as wav_io:
-                        with wave.open(wav_io, 'rb') as wav_file:
-                            sample_rate = wav_file.getframerate()
-                            frames = wav_file.readframes(wav_file.getnframes())
-                            audio_np = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-                            sd.play(audio_np, samplerate=sample_rate)
-                            sd.wait()  # Wait for playback to complete
-                    
-                    # 通知服务器音频播放完成
-                    await self.websocket.send("playback_finished")
-                else:
-                    # 检查是否是转录文本
-                    if isinstance(data, str) and data.startswith("TRANSCRIPTION:"):
-                        transcription = data[14:].strip()  # 去掉前缀
-                        if transcription != self.last_transcription:  # 避免重复显示相同的转录
-                            self.last_transcription = transcription
-                            logger.info(f"您说: {transcription}")
-                    else:
-                        # Log text data instead of trying to play it
-                        logger.info(f"Received text: {data}")
+
+                if isinstance(data, str):
+                    if data.startswith("TRANSCRIPTION:"):
+                        # 处理转录文本
+                        transcription = data[len("TRANSCRIPTION:"):].strip()
+                        self.last_transcription = transcription
+                        logger.info(f"转录结果: {transcription}")
+                    elif data.startswith("AUDIO:"):
+                        # 处理音频数据
+                        audio_data = data[len("AUDIO:"):]
+                        await self.play_audio(audio_data)
+
             except Exception as e:
                 logger.error(f"Receive error: {e}")
                 break
