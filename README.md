@@ -36,12 +36,12 @@ It runs at  http://localhost:11434/api/chat
 
 ## TTS
 
-We use F5-TTS-main for TTS. It runs at  for TTS. It runs at  URL_ADDRESS:5000/generate
+We use f5-tts for TTS. It runs at  for TTS. It runs at  URL_ADDRESS:5000/generate
 
 This is needs to activate the f5-tts environment in another command line. Then run the app.py in that environment.
 
 ```bash
-conda activate python310
+conda activate f5-tts
 python app.py
 ```
 
