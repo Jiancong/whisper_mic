@@ -115,6 +115,7 @@ class AudioWebSocketClient:
                 if isinstance(data, bytes):
                     # 通知服务器开始播放音频
                     await self.websocket.send("playback_started")
+                    print("playback_started")
                     
                     # Handle audio data (assumed to be WAV format)
                     with io.BytesIO(data) as wav_io:
@@ -127,13 +128,15 @@ class AudioWebSocketClient:
                     
                     # 通知服务器音频播放完成
                     await self.websocket.send("playback_finished")
+                    print("playback_finished")
                 else:
                     # 检查是否是转录文本
                     if isinstance(data, str) and data.startswith("TRANSCRIPTION:"):
+                        logger.info("收到了从服务端发来的转录文本")
                         transcription = data[14:].strip()  # 去掉前缀
                         if transcription != self.last_transcription:  # 避免重复显示相同的转录
                             self.last_transcription = transcription
-                            logger.info(f"您说: {transcription}")
+                            logger.info(f"转录文本内容为: {transcription}")
                     else:
                         # Log text data instead of trying to play it
                         logger.info(f"Received text: {data}")

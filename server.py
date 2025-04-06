@@ -150,7 +150,7 @@ async def process_audio(websocket, path):
         # Send the first question audio
         await tts_processor.send_audio(websocket, QUESTION_1_FILE)
         logger.info("Sent first question: Can you briefly introduce yourself?")
-        is_playing_audio = True
+
         awaiting_response = True
         question_counter += 1
 
@@ -201,7 +201,7 @@ async def process_audio(websocket, path):
                 if not is_playing_audio:
                     # 检查消息是否为二进制数据
                     if not isinstance(message, bytes):
-                        logger.warning(f"收到非二进制数据: {message}")
+                        logger.warning(f"收到非二进制数据: {message} 。异常我们期待的是音频二进制数据，跳过。")
                         continue
 
                     audio_chunk = np.frombuffer(message, dtype=np.float32)
@@ -275,7 +275,7 @@ async def process_audio(websocket, path):
                                 logger.info(f"使用队列中的下一个问题: {question_text}")
                                 await tts_processor.send_audio(websocket, next_audio_path)
                                 logger.info(f"Sent next question: {next_audio_path}")
-                                is_playing_audio = True
+
                                 awaiting_response = True
                                 question_counter += 1
                             except (asyncio.QueueEmpty, asyncio.TimeoutError):
@@ -284,7 +284,7 @@ async def process_audio(websocket, path):
                                 if os.path.exists(next_audio_path):
                                     await tts_processor.send_audio(websocket, next_audio_path)
                                     logger.info(f"Sent next question from file: {next_audio_path}")
-                                    is_playing_audio = True
+
                                     awaiting_response = True
                                     question_counter += 1
                                 else:
@@ -303,7 +303,7 @@ async def process_audio(websocket, path):
                             
                             logger.info(f"Response too short ({len(transcription)} chars), sending more_details.wav")
                             await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
-                            is_playing_audio = True
+
                             awaiting_response = True  # Continue awaiting a longer response
                             # 不清空音频缓冲区，保留已收集的音频
 
