@@ -244,6 +244,8 @@ class AudioSender:
         """处理音频队列并发送数据"""
         import asyncio
         from queue import Full, Empty
+
+        logger.info("开始处理音频队列 process_audio_queue")
         
         buffer = np.array([], dtype=np.float32)  # 创建本地缓冲区
         last_send_time = time.time()
@@ -267,117 +269,90 @@ class AudioSender:
             try:
                 # 定期记录缓冲区状态
                 current_time = time.time()
-                if current_time - last_log_time > 2.0:
-                    current_queue_size = audio_queue.qsize()
-                    logger.info(f"音频缓冲区状态: {len(buffer)/self.sample_rate:.2f}秒, {buffer_count}个块, 距离上次发送: {current_time-last_send_time:.2f}秒")
-                    logger.info(f"当前队列大小: {audio_queue.qsize()}/{audio_queue.maxsize}")
-                    last_log_time = current_time   
+                if current_time - last_log_time > 5.0:
+                    queue_size = audio_queue.qsize()
+                    logger.info(f"音频队列状态: 大小={queue_size}/{audio_queue.maxsize}, 缓冲区={len(buffer)/self.sample_rate:.2f}秒")
 
-                # 使用更短的超时时间获取音频数据
+                    # 只有当队列不为空时才记录详细状态
+                    if queue_size == last_queue_size and queue_size > 0:
+                        logger.warning(f"队列大小在过去5秒内没有变化: {queue_size}")
+                    else:
+                        # 队列为空时只记录debug级别的日志
+                        logger.debug(f"队列为空，等待输入...")
+
+                    last_queue_size = queue_size
+                    last_log_time = current_time
+
+
+                # 尝试直接从队列获取数据（非阻塞方式）
                 try:
-                    audio_data = await asyncio.wait_for(
-                        asyncio.to_thread(audio_queue.get), 
-                        timeout=0.1
-                    )
+                    # 使用非阻塞方式获取数据
+                    audio_data = audio_queue.get_nowait()
+                    queue_get_failures = 0 # 重置失败计数
 
-                    logger.info(f"从队列中获取到音频数据, 长度为: {len(audio_data)} 样本")
-
-                    logger.info(f"开始保存原始音频数据，buffer_count={buffer_count}")
-                    # 保存从队列获取的原始音频数据
-                    self.save_debug_audio(audio_data, prefix=f"queue_get_{buffer_count}")
-                    logger.info(f"结束保存原始音频数据")
-                    
                     # 检查是否为静音标记
                     if len(audio_data) == 1 and np.all(audio_data == 0):
-                        logger.info("收到静音标记，发送用户停止说话信号，特殊处理")
+                        logger.info("收到静音标记，发送当前缓冲区并通知服务器用户停止说话")
                         
-                        # 如果缓存中有足够的音频数据，发送它
-                        if len(recent_audio_buffer) > 0.5 * self.sample_rate:  # 至少0.5秒
-                            logger.info(f"发送最近缓存的音频: {len(recent_audio_buffer)/self.sample_rate:.2f}秒")
-                            await self.send_audio_data(recent_audio_buffer)
-                            recent_audio_buffer = np.array([], dtype=np.float32)
+                        # 如果缓冲区有数据，先发送
+                        if len(buffer) > 0:
+                            await self.send_audio_data(buffer)
+                            buffer = np.array([], dtype=np.float32)
+                            buffer_count = 0
                         
-                        # 发送一个特殊消息给服务器，表示用户停止说话
-                        if self.websocket:
-                            await self.send_control_message("USER_STOPPED_SPEAKING")
-
-                            # 如果缓冲区中还有数据，先发送剩余数据
-                            if len(buffer) > 0:
-                                logger.info(f"发送停止说话前的剩余缓冲区: {len(buffer)/self.sample_rate:.2f}秒")
-                                await self.send_audio_data(buffer)
-                                buffer = np.array([], dtype=np.float32)
-                        
-                        # 清空缓冲区
-                        buffer = np.array([], dtype=np.float32)
-                        buffer_count = 0
-                        last_send_time = current_time
-                        audio_queue.task_done()
-                        logger.info("已发送用户停止说话信号，跳过")
-                        continue
+                        # 发送静音通知
+                        await self.send_control_message("SILENCE_DETECTED")
                     else:
-                        logger.info("非静音数据，继续处理")
+                        # 将新的音频数据添加到本地缓冲区
+                        buffer = np.concatenate((buffer, audio_data))
+                        buffer_count += 1
+                        logger.info(f"添加音频到缓冲区: 当前大小={len(buffer)/self.sample_rate:.2f}秒, 块数={buffer_count}")
+                        
+                        # 当缓冲区达到一定大小时发送
+                        if len(buffer) >= 2 * self.sample_rate:  # 2秒的音频
+                            logger.info(f"缓冲区达到发送阈值: {len(buffer)/self.sample_rate:.2f}秒")
+                            await self.send_audio_data(buffer)
+                            buffer = np.array([], dtype=np.float32)
+                            buffer_count = 0
+                            last_send_time = current_time
+                
+                    # 标记任务完成
+                    audio_queue.task_done()
                     
-                    buffer_count += 1
-
-                    # 将新的音频数据添加到本地缓冲区
-                    buffer = np.concatenate((buffer, audio_data))
+                except Empty:
+                    # 队列为空，等待一小段时间
+                    queue_get_failures += 1
                     
-                    # 更新最近的音频缓存
-                    recent_audio_buffer = np.concatenate((recent_audio_buffer, audio_data))
-                    # 如果缓存太长，只保留最近的部分
-                    max_samples = max_buffer_duration * self.sample_rate
-                    if len(recent_audio_buffer) > max_samples:
-                        recent_audio_buffer = recent_audio_buffer[-max_samples:]
-                    
-                    logger.info(f"添加音频到缓冲区: 当前大小={len(buffer)/self.sample_rate:.2f}秒, 块数={buffer_count}")
-                    
-                    # 保存当前缓冲区状态
-                    if buffer_count % 5 == 0:  # 每5个块保存一次
-                        self.save_debug_audio(buffer, prefix=f"buffer_state_{buffer_count}")
-
-                    audio_queue.task_done()  
-
-                    # 检查是否有足够的音频数据可以发送
-                    # 如果音频块长度超过5秒，直接发送
-                    if len(buffer) >= 5 * self.sample_rate:
-                        logger.info(f"缓冲区达到5秒，发送音频: {len(buffer)/self.sample_rate:.2f}秒")
-                        await self.send_audio_data(buffer)
-                        buffer = np.array([], dtype=np.float32)
-                        buffer_count = 0
-                        last_send_time = time.time()
-
-                except asyncio.TimeoutError:
-                    # 如果缓冲区有数据且已经累积了足够长的时间，即使队列超时也发送
-                    current_time = time.time()
-                    if len(buffer) > 0 and (current_time - last_send_time >= 5.0):
-                        logger.info(f"队列超时，发送现有缓冲区: {len(buffer)/self.sample_rate:.2f}秒")
+                    # 如果缓冲区有数据且已经累积了足够长的时间，即使队列为空也发送
+                    if len(buffer) > 0 and (current_time - last_send_time >= 3.0):
+                        logger.info(f"队列为空但缓冲区有数据，发送现有缓冲区: {len(buffer)/self.sample_rate:.2f}秒")
                         await self.send_audio_data(buffer)
                         buffer = np.array([], dtype=np.float32)
                         buffer_count = 0
                         last_send_time = current_time
+                    
+                    # 避免CPU占用过高
+                    await asyncio.sleep(0.1)
+                    
+                    # 只在第一次失败和每10次失败后记录日志
+                    if queue_get_failures == 1 or queue_get_failures % 10 == 0:
+                        logger.debug(f"队列为空，等待数据... (尝试次数: {queue_get_failures})")
+                    
                     continue
             
             except Exception as e:
                 logger.error(f"处理音频队列时出错: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-                # 保存错误信息到文件
-                error_file = os.path.join(self.debug_dir, f"error_{time.time():.2f}.txt")
-                with open(error_file, 'w') as f:
-                    f.write(f"处理音频队列时出错: {e}\n")
-                    f.write(traceback.format_exc())
-                break
+                # 不退出循环，尝试继续处理
+                await asyncio.sleep(0.5)
                 
         # 如果退出循环时缓冲区还有数据，发送剩余数据
         if len(buffer) > 0:
+            logger.info(f"处理结束，发送剩余缓冲区: {len(buffer)/self.sample_rate:.2f}秒")
             try:
-                logger.info(f"发送剩余缓冲区: {len(buffer)/self.sample_rate:.2f}秒")
-                # 保存最终发送前的缓冲区
-                self.save_debug_audio(buffer, prefix=f"final_buffer_{buffer_count}")                
                 await self.send_audio_data(buffer)
             except Exception as e:
                 logger.error(f"发送剩余缓冲区时出错: {e}")
-                # 保存错误信息到文件
-                error_file = os.path.join(self.debug_dir, f"final_error_{time.time():.2f}.txt")
-                with open(error_file, 'w') as f:
-                    f.write(f"发送剩余缓冲区时出错: {e}\n")                
+        
+        logger.info("音频队列处理完成")               

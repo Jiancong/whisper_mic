@@ -17,6 +17,8 @@ from audio_sender import AudioSender  # 导入新的AudioSender类
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+
+logging.getLogger('audio_sender').setLevel(logging.INFO)  # 设置为INFO级别，以确保所有日志都被记录
 logger = logging.getLogger(__name__)
 
 # Audio constants
@@ -26,7 +28,7 @@ CHANNELS = 1
 DURATION = None
 MAX_MESSAGE_SIZE = 10_000_000  # 10MB to handle larger messages
 MAX_QUEUE_SIZE = 1000  # 增加队列大小，从200到400，可以缓存更多音频
-SILENCE_THRESHOLD = 0.01  # 静音检测阈值
+SILENCE_THRESHOLD = 0.1  # 静音检测阈值
 SILENCE_DURATION = 5  # 静音持续5秒后停止录音
 
 # 添加调试音频保存的全局计数器
@@ -103,6 +105,7 @@ class AudioWebSocketClient:
         """Audio callback function for microphone input"""
         if status:
             logger.warning(f"Audio callback status: {status}")
+
         if self.running:
             # 获取音频数据
             audio_data = indata[:, 0].astype(np.float32)
@@ -156,22 +159,49 @@ class AudioWebSocketClient:
                 try:
                     # 使用非阻塞方式添加数据，如果队列已满则丢弃
                     self.audio_queue.put_nowait(audio_data)
-                    logger.info(f"已添加音频数据到队列: {len(audio_data)} 样本")
+                    logger.info(f"已添加音频数据到队列: {len(audio_data)} 样本, 队列大小: {self.audio_queue.qsize()}/{self.audio_queue.maxsize}")
+                    
+                    # 检查队列大小是否超过阈值
+                    if self.audio_queue.qsize() > 10 and self.audio_queue.qsize() % 5 == 0:
+                        logger.warning(f"队列积累了大量数据: {self.audio_queue.qsize()} 项，可能存在处理延迟")
                 except Full:
                     logger.warning("音频队列已满，丢弃一帧")
 
     async def send_audio(self):
         """Send audio from queue to WebSocket"""
+
+        logger.info("开始发送音频   send_audio")
         # 设置WebSocket连接
         self.audio_sender.set_websocket(self.websocket)
         
         # 记录开始处理音频队列的时间
         start_time = time.time()
         logger.info(f"开始处理音频队列，时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"队列初始状态: {self.audio_queue.qsize()}/{self.audio_queue.maxsize}")
+
+        # 添加一个标志，表示是否已经启动了处理任务
+        self._audio_processing_active = True
+
+        # 处理音频队列
         
-        # 使用AudioSender处理音频队列
-        await self.audio_sender.process_audio_queue(self.audio_queue, self.running)
+        try:
+            # 使用AudioSender处理音频队列
+            await self.audio_sender.process_audio_queue(self.audio_queue, self.running)
+        except Exception as e:
+            logger.error(f"处理音频队列时发生异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
         
+            # 如果发生异常，等待一段时间后重试
+            if self.running and self._audio_processing_active:
+                logger.info("尝试重新启动音频队列处理...")
+                self._audio_processing_active = False  # 防止重复启动
+                await asyncio.sleep(1)
+                asyncio.create_task(self.send_audio())  # 使用create_task而不是递归调用
+                return
+        finally:
+            self._audio_processing_active = False
+
         # 记录结束处理音频队列的时间
         end_time = time.time()
         logger.info(f"结束处理音频队列，时间: {time.strftime('%Y-%m-%d %H:%M:%S')}, 总时长: {end_time - start_time:.2f}秒")
