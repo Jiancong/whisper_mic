@@ -6,7 +6,7 @@ import time
 import requests
 import os
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import FileSystemEventHandler 
 from asr_module import ASRProcessor  # 导入ASR处理器
 from tts_module import TTSProcessor  # 导入TTS处理器
 
@@ -22,11 +22,11 @@ TTS_PREDEFINED_AUDIO_DIR = "./tts_predefined_audio"  # Predefined TTS audio dire
 TTS_AUDIO_DIR = "./tts_audio"  # Generated TTS audio directory
 INTERVIEWER_NAME = "elon_musk"  # Interviewer subdirectory name
 MIN_RESPONSE_LENGTH = 20  # Minimum response length (characters)
-TIMEOUT_SECONDS = 20  # Timeout duration (seconds, 20 seconds)
+TIMEOUT_SECONDS = 60  # 增加超时时间从20秒到60秒
 MAX_QUESTIONS = 0  # Maximum number of questions
-TRANSCRIPTION_INTERVAL = 0.5  # 更频繁地进行转录，从0.5秒减少到0.2秒
-MIN_AUDIO_BUFFER_SIZE = 1600  # 约0.1秒的音频
-MAX_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 60  # 最多保留60秒的音频数据，从30秒增加到60秒
+TRANSCRIPTION_INTERVAL = 5  # 增加转录间隔时间，从2秒到5秒
+MIN_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 5  # 至少需要5秒的音频才开始转录，而不是0.1秒
+MAX_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 120  # 最多保留120秒的音频数据，从60秒增加到120秒
 SILENCE_THRESHOLD = 0.0005  # 静音检测阈值，降低以捕获更多音频
 
 # Predefined audio file paths
@@ -89,20 +89,31 @@ class HotReloadHandler(FileSystemEventHandler):
 # 实时转录任务 - 使用ASR模块
 async def transcribe_periodically(websocket, audio_buffer, last_transcription_time):
     current_time = time.time()
-    # 减少等待时间，只要有足够的音频数据就进行转录
+    # 只有当累积了足够长的音频(至少5秒)且距离上次转录已经过了足够时间，才进行转录
     if (current_time - last_transcription_time >= TRANSCRIPTION_INTERVAL and 
-            len(audio_buffer) >= MIN_AUDIO_BUFFER_SIZE):
+            len(audio_buffer) >= SAMPLE_RATE * 5):    # 至少5秒音频才尝试转录
         try:
-            # 减少日志输出频率
-            if len(audio_buffer) % 32000 == 0:  # 每2秒音频输出一次日志
-                logger.info(f"开始转录音频缓冲区，大小: {len(audio_buffer)} 样本")
+            logger.info(f"开始转录音频缓冲区，大小: {len(audio_buffer)} 样本，最大值: {np.max(np.abs(audio_buffer))}, 时长: {len(audio_buffer)/SAMPLE_RATE:.2f}秒")
             
-            # 使用ASR模块进行转录 - 增强参数
-            transcription, info = asr_processor.transcribe_segment(
+            # 保存当前要转录的完整音频缓冲区
+            asr_processor.save_debug_audio(audio_buffer, prefix="periodic_transcribe_buffer")            
+            
+            # 确保音频数据格式正确
+            if audio_buffer.dtype != np.float32:
+                logger.warning(f"音频数据类型不是float32，而是{audio_buffer.dtype}，尝试转换")
+                audio_buffer = audio_buffer.astype(np.float32)
+
+            # 确保音频数据幅度在[-1, 1]范围内
+            max_val = np.max(np.abs(audio_buffer))
+            if max_val > 1.0:
+                logger.warning(f"音频数据超出范围，最大值为{max_val}，进行归一化")
+                audio_buffer = audio_buffer / max_val                
+
+           
+            # 不使用降噪逻辑
+            transcription, info = asr_processor.transcribe(
                 audio_buffer, 
-                max_duration_seconds=15,  # 增加处理的音频长度
                 beam_size=5  # 增加beam_size提高准确性
-            
             )
             
             if transcription.strip():  # 确保转录内容不为空
@@ -110,7 +121,7 @@ async def transcribe_periodically(websocket, audio_buffer, last_transcription_ti
                 # 发送转录文本回客户端
                 await websocket.send(f"TRANSCRIPTION: {transcription}")
             else:
-                logger.debug("转录结果为空")  # 降低日志级别
+                logger.debug("转录结果为空，可能是音频质量问题或背景噪音")  # 降低日志级别
             return current_time
         except Exception as e:
             logger.error(f"实时转录错误: {e}")
@@ -180,33 +191,126 @@ async def process_audio(websocket, path):
                 # 添加更详细的日志
                 message = await asyncio.wait_for(websocket.recv(), timeout=TIMEOUT_SECONDS)
 
+                # 重置超时计时器
+                start_time = time.time()
+                # 记录当前超时设置
+                logger.debug(f"当前超时设置: {TIMEOUT_SECONDS}秒, 剩余时间: {TIMEOUT_SECONDS - (time.time() - start_time):.2f}秒")
+
                 # logger.info(f"收到客户端消息: {message}")
                 
                 # 只在收到非二进制数据或首次连接时输出详细日志
                 if isinstance(message, str) or audio_buffer.size == 0:
                     logger.info(f"收到客户端消息，类型: {type(message)}")
                 
+                # 处理客户端发送的停止说话信号
+                if message == "USER_STOPPED_SPEAKING":
+                    logger.info("收到用户停止说话信号，进行最终转录")
+                    
+                    # 如果缓冲区有足够的音频数据，进行最终转录
+                    if len(audio_buffer) >= MIN_AUDIO_BUFFER_SIZE and awaiting_response:
+                        # 保存最终的音频缓冲区用于调试
+                        asr_processor.save_debug_audio(audio_buffer, prefix="final_transcribe_buffer")
+                        
+                        # 进行最终转录
+                        transcription, _ = asr_processor.transcribe(audio_buffer, beam_size=5)
+                        
+                        if transcription and len(transcription) > 0:
+                            logger.info(f"最终转录结果: {transcription}")
+                            await websocket.send(f"TRANSCRIPTION: {transcription}")
+                            
+                            # 如果转录内容足够长，处理用户回答
+                            if len(transcription) >= MIN_RESPONSE_LENGTH:
+                                conversation_history.append({"role": "user", "content": transcription})
+                                
+                                # 检查队列中是否有准备好的TTS音频
+                                try:
+                                    next_audio_path, question_text = await asyncio.wait_for(tts_queue.get(), timeout=0.1)
+                                    logger.info(f"使用队列中的下一个问题: {question_text}")
+                                    await tts_processor.send_audio(websocket, next_audio_path)
+                                    logger.info(f"Sent next question: {next_audio_path}")
+
+                                    awaiting_response = True
+                                    question_counter += 1
+                                except (asyncio.QueueEmpty, asyncio.TimeoutError):
+                                    # 如果队列为空，检查文件系统
+                                    next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
+                                    if os.path.exists(next_audio_path):
+                                        await tts_processor.send_audio(websocket, next_audio_path)
+                                        logger.info(f"Sent next question from file: {next_audio_path}")
+
+                                        awaiting_response = True
+                                        question_counter += 1
+                                    else:
+                                        logger.info("No more questions available. Ending interview.")
+                                        await websocket.send("All questions have been asked. Thank you for the interview!")
+                                        break
+                                        
+                                # 清空音频缓冲区，准备接收下一个回答
+                                audio_buffer = np.array([], dtype=np.float32)
+                                start_time = time.time()  # Reset timeout after valid response
+                                silence_counter = 0
+                            else:
+                                logger.info(f"最终转录结果太短 ({len(transcription)} 字符)，发送more_details.wav")
+                                await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                awaiting_response = True
+                                # 清空音频缓冲区，准备接收新的回答
+                                audio_buffer = np.array([], dtype=np.float32)
+                        else:
+                            logger.info("最终转录结果为空，继续等待用户输入")
+                    
+                    continue
+                
                 # Handle client playback status messages
-                if isinstance(message, str):
-                    if message == "playback_started":
-                        is_playing_audio = True
-                        logger.info("客户端开始播放音频")
-                        continue
-                    elif message == "playback_finished":
-                        logger.info("客户端完成音频播放")
-                        is_playing_audio = False
-                        continue
+                if isinstance(message, str) and message.startswith("AUDIO:"):
+                    # 处理带AUDIO:前缀的音频数据
+                    try:
+                        # 客户端发送的是二进制数据，需要先解码
+                        audio_bytes = message[6:].encode('latin1')  # 使用latin1编码将字符串转回二进制
+                        audio_chunk = np.frombuffer(audio_bytes, dtype=np.float32)
+                        logger.info(f"收到客户端音频数据，大小: {len(audio_chunk)} 样本，最大值: {np.max(np.abs(audio_chunk))}")
+
+                        # 保存调试音频
+                        asr_processor.save_debug_audio(audio_chunk, prefix="received_audio")
+                            
+                        # 将新的音频数据添加到缓冲区
+                        audio_buffer = np.concatenate((audio_buffer, audio_chunk))
+                        logger.info(f"音频缓冲区当前大小: {len(audio_buffer)} 样本, 时长: {len(audio_buffer)/SAMPLE_RATE:.2f}秒")
+                        
+                        # 限制缓冲区大小
+                        if len(audio_buffer) > MAX_AUDIO_BUFFER_SIZE:
+                            audio_buffer = audio_buffer[-MAX_AUDIO_BUFFER_SIZE:]
+
+
+                        # 重置超时计时器，只要收到音频数据就刷新
+                        start_time = time.time()
+                        silence_counter = 0  # 重置静音计数器
+
+                        # 定期进行转录
+                        last_transcription_time = await transcribe_periodically(websocket, audio_buffer, last_transcription_time)
+                        
+                    except Exception as e:
+                        logger.error(f"处理音频数据错误: {e}")
+                    continue
+                elif message == "playback_started":
+                    is_playing_audio = True
+                    logger.info("客户端开始播放从服务端发送过去的音频")
+                    continue
+                elif message == "playback_finished":
+                    logger.info("客户端完成从服务端发功过去的音频播放")
+                    is_playing_audio = False
+                    continue
 
                 # Process audio input when no audio is playing
                 if not is_playing_audio:
                     # 检查消息是否为二进制数据
                     if not isinstance(message, bytes):
-                        logger.warning(f"收到非二进制数据: {message} 。异常我们期待的是音频二进制数据，跳过。")
+                        logger.warning(f"收到非二进制数据: {message} 。我们期待的是二进制音频数据，跳过。")
                         continue
 
+                    logger.info(f"收到客户端音频数据，大小: {len(message)} 字节")
                     audio_chunk = np.frombuffer(message, dtype=np.float32)
                     if audio_chunk.size == 0:
-                        logger.warning("收到空音频块")
+                        logger.warning("收到空音频块, 跳过重听")
                         continue
 
                     # # 检测是否为有效音频（非静音）
@@ -222,8 +326,11 @@ async def process_audio(websocket, path):
                     #     silence_counter = 0
                     #     last_audio_time = time.time()
                     
+                    #logger.info("开始降噪")
                     # 使用ASR模块进行降噪，但保留更多原始信号
-                    denoised_chunk = asr_processor.denoise_audio(audio_chunk)
+                    #denoised_chunk = asr_processor.denoise_audio(audio_chunk)
+                    denoised_chunk = audio_chunk
+                    #logger.info("降噪完成")
 
                     # 限制音频缓冲区大小，防止内存溢出
                     if len(audio_buffer) > MAX_AUDIO_BUFFER_SIZE:
@@ -234,6 +341,7 @@ async def process_audio(websocket, path):
                     # 将新的音频数据添加到缓冲区
                     audio_buffer = np.concatenate((audio_buffer, denoised_chunk))
                     
+                    logger.info("开始实时转录操作并检查转录内容是否够长")
                     # 实时转录 - 更频繁地进行转录
                     last_transcription_time = await transcribe_periodically(websocket, audio_buffer, last_transcription_time)
 
@@ -246,6 +354,8 @@ async def process_audio(websocket, path):
                     )
                     
                     if should_transcribe:
+                        logger.info("应该进行转录")
+                        last_transcription_time = time.time()
                         # 使用ASR模块进行完整转录，增加参数提高准确性
                         transcription, _ = asr_processor.transcribe(
                             audio_buffer, 
@@ -316,6 +426,9 @@ async def process_audio(websocket, path):
                     break
 
             except asyncio.TimeoutError:
+                elapsed = time.time() - start_time
+                logger.warning(f"超时: {elapsed:.2f}秒内没有收到响应 (设置的超时时间: {TIMEOUT_SECONDS}秒)")
+
                 logger.info("Timeout 222: No response within 20 seconds.")
                 if os.path.exists(BYE_FILE):
                     await tts_processor.send_audio(websocket, BYE_FILE)
