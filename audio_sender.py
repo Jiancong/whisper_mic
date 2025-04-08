@@ -43,7 +43,7 @@ class AudioSender:
                 
             # 保存音频文件
             sf.write(debug_file, audio_data, self.sample_rate)
-            logger.info(f"已保存客户端调试音频到: {debug_file}, 长度: {len(audio_data)/self.sample_rate:.2f}秒")
+            logger.debug(f"已保存客户端调试音频到: {debug_file}, 长度: {len(audio_data)/self.sample_rate:.2f}秒")
             
             # 如果音频文件太多，删除旧文件
             self.cleanup_debug_files(max_files=100)
@@ -156,17 +156,17 @@ class AudioSender:
             
             return combined_speech
         else:
-            logger.info("未提取到有效语音段，返回原始音频")
+            logger.debug("未提取到有效语音段，返回原始音频")
             return audio_data
     
     async def send_audio_data(self, audio_data):
         """发送单个音频数据块"""
         if len(audio_data) == 0:
-            logger.info("尝试发送空音频缓冲区，已跳过")
+            logger.debug("尝试发送空音频缓冲区，已跳过")
             return False
         
         if not self.websocket:
-            logger.info("WebSocket连接未设置，无法发送音频数据")
+            logger.debug("WebSocket连接未设置，无法发送音频数据")
             return False
         
         # 保存原始音频数据
@@ -177,10 +177,10 @@ class AudioSender:
         
         # 如果提取的语音内容太短，可能不包含有效语音，跳过发送
         if len(speech_audio) < 0.5 * self.sample_rate:  # 小于0.5秒
-            logger.info(f"提取的语音内容太短 ({len(speech_audio)/self.sample_rate:.2f}秒)，跳过发送")
+            logger.debug(f"提取的语音内容太短 ({len(speech_audio)/self.sample_rate:.2f}秒)，跳过发送")
             return False
         
-        logger.info(f"发送音频数据到服务端 #{self.send_count}: 形状={speech_audio.shape}, 类型={speech_audio.dtype}, 最大值={np.max(np.abs(speech_audio))}, 时长={len(speech_audio)/self.sample_rate:.2f}秒")
+        logger.debug(f"发送音频数据到服务端 #{self.send_count}: 形状={speech_audio.shape}, 类型={speech_audio.dtype}, 最大值={np.max(np.abs(speech_audio))}, 时长={len(speech_audio)/self.sample_rate:.2f}秒")
 
         # 保存发送前的音频数据
         self.save_debug_audio(speech_audio, prefix=f"send_{self.send_count}")
@@ -199,7 +199,7 @@ class AudioSender:
         if max_val < 0.5:  # 提高阈值
             gain = 0.5 / max_val if max_val > 0 else 5.0
             speech_audio = speech_audio * min(gain, 10.0)  # 增加最大增益到10倍
-            logger.info(f"增加音频音量，增益={min(gain, 10.0)}")
+            logger.debug(f"增加音频音量，增益={min(gain, 10.0)}")
             
             # 保存增益后的音频数据
             self.save_debug_audio(speech_audio, prefix=f"send_gain_{self.send_count}")
@@ -216,7 +216,7 @@ class AudioSender:
             await self.websocket.send(f"AUDIO:{encoded_audio}")
             
             # 添加调试信息，确认数据已发送
-            logger.info(f"已发送音频数据 #{self.send_count}，大小: {len(speech_audio)} 样本，时长: {len(speech_audio)/self.sample_rate:.2f}秒")
+            logger.debug(f"已发送音频数据 #{self.send_count}，大小: {len(speech_audio)} 样本，时长: {len(speech_audio)/self.sample_rate:.2f}秒")
             return True
         except Exception as e:
             logger.error(f"发送音频数据时出错: {e}")
@@ -232,7 +232,7 @@ class AudioSender:
         
         try:
             await self.websocket.send(message)
-            logger.info(f"已发送控制消息: {message}")
+            logger.debug(f"已发送控制消息: {message}")
             return True
         except Exception as e:
             logger.error(f"发送控制消息时出错: {e}")
@@ -245,7 +245,7 @@ class AudioSender:
         import asyncio
         from queue import Full, Empty
 
-        logger.info("开始处理音频队列 process_audio_queue")
+        logger.debug("开始处理音频队列 process_audio_queue")
         
         buffer = np.array([], dtype=np.float32)  # 创建本地缓冲区
         last_send_time = time.time()
@@ -271,7 +271,7 @@ class AudioSender:
                 current_time = time.time()
                 if current_time - last_log_time > 5.0:
                     queue_size = audio_queue.qsize()
-                    logger.info(f"音频队列状态: 大小={queue_size}/{audio_queue.maxsize}, 缓冲区={len(buffer)/self.sample_rate:.2f}秒")
+                    logger.debug(f"音频队列状态: 大小={queue_size}/{audio_queue.maxsize}, 缓冲区={len(buffer)/self.sample_rate:.2f}秒")
 
                     # 只有当队列不为空时才记录详细状态
                     if queue_size == last_queue_size and queue_size > 0:
@@ -306,11 +306,11 @@ class AudioSender:
                         # 将新的音频数据添加到本地缓冲区
                         buffer = np.concatenate((buffer, audio_data))
                         buffer_count += 1
-                        logger.info(f"添加音频到缓冲区: 当前大小={len(buffer)/self.sample_rate:.2f}秒, 块数={buffer_count}")
+                        logger.debug(f"添加音频到缓冲区: 当前大小={len(buffer)/self.sample_rate:.2f}秒, 块数={buffer_count}")
                         
                         # 当缓冲区达到一定大小时发送
                         if len(buffer) >= 2 * self.sample_rate:  # 2秒的音频
-                            logger.info(f"缓冲区达到发送阈值: {len(buffer)/self.sample_rate:.2f}秒")
+                            logger.debug(f"缓冲区达到发送阈值: {len(buffer)/self.sample_rate:.2f}秒")
                             await self.send_audio_data(buffer)
                             buffer = np.array([], dtype=np.float32)
                             buffer_count = 0
@@ -325,7 +325,7 @@ class AudioSender:
                     
                     # 如果缓冲区有数据且已经累积了足够长的时间，即使队列为空也发送
                     if len(buffer) > 0 and (current_time - last_send_time >= 3.0):
-                        logger.info(f"队列为空但缓冲区有数据，发送现有缓冲区: {len(buffer)/self.sample_rate:.2f}秒")
+                        logger.debug(f"队列为空但缓冲区有数据，发送现有缓冲区: {len(buffer)/self.sample_rate:.2f}秒")
                         await self.send_audio_data(buffer)
                         buffer = np.array([], dtype=np.float32)
                         buffer_count = 0
@@ -349,7 +349,7 @@ class AudioSender:
                 
         # 如果退出循环时缓冲区还有数据，发送剩余数据
         if len(buffer) > 0:
-            logger.info(f"处理结束，发送剩余缓冲区: {len(buffer)/self.sample_rate:.2f}秒")
+            logger.debug(f"处理结束，发送剩余缓冲区: {len(buffer)/self.sample_rate:.2f}秒")
             try:
                 await self.send_audio_data(buffer)
             except Exception as e:

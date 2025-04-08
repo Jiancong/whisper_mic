@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Audio constants
 SAMPLE_RATE = 16000
-BLOCK_SIZE = 80000  # 增加块大小，从4000到80000，每次收集5秒的音频
+BLOCK_SIZE = 48000  # 增加块大小，从4000到80000，每次收集5秒的音频
 CHANNELS = 1
 DURATION = None
 MAX_MESSAGE_SIZE = 10_000_000  # 10MB to handle larger messages

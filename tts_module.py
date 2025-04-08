@@ -81,6 +81,8 @@ class TTSProcessor:
         question_counter = start_counter
         tasks = []
         task_info = {}  # 存储任务信息
+
+        history_copy = conversation_history.copy()
         
         while question_counter <= max_questions:
             try:

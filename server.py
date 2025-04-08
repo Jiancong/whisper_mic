@@ -15,6 +15,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration parameters
+OLLAMA_LLM_NAME= "qwen2.5-coder:14b"
 OLLAMA_API_URL = "http://localhost:11434/api/chat"  # Ollama API endpoint
 TTS_API_URL = "http://localhost:5000/generate"  # TTS service endpoint
 SAMPLE_RATE = 16000  # Audio sample rate
@@ -24,8 +25,8 @@ INTERVIEWER_NAME = "elon_musk"  # Interviewer subdirectory name
 MIN_RESPONSE_LENGTH = 20  # Minimum response length (characters)
 TIMEOUT_SECONDS = 60  # 增加超时时间从20秒到60秒
 MAX_QUESTIONS = 0  # Maximum number of questions
-TRANSCRIPTION_INTERVAL = 5  # 增加转录间隔时间，从2秒到5秒
-MIN_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 5  # 至少需要5秒的音频才开始转录，而不是0.1秒
+TRANSCRIPTION_INTERVAL = 3  # 增加转录间隔时间，从2秒到5秒
+MIN_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 3  # 至少需要5秒的音频才开始转录，而不是0.1秒
 MAX_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 120  # 最多保留120秒的音频数据，从60秒增加到120秒
 SILENCE_THRESHOLD = 0.0005  # 静音检测阈值，降低以捕获更多音频
 
@@ -53,8 +54,14 @@ My main skills:
 
 # Initialize conversation history
 conversation_history = [
-    {"role": "system", "content": "You are an interviewer asking technical questions based on the candidate's resume. Ask one concise question at a time, max 20-30 words, one sentence only."},
-    {"role": "user", "content": CONTEXT}
+    {
+        "role": "system", 
+        "content": "You are an interviewer asking technical questions based on the candidate's resume. Ask one concise question at a time, max 10-20 words, one sentence only."
+    },
+    {
+        "role": "user", 
+        "content": CONTEXT
+    }
 ]
 
 # 初始化ASR处理器
@@ -65,15 +72,22 @@ logger.info("ASR处理器初始化完成")
 tts_processor = TTSProcessor(tts_api_url=TTS_API_URL, tts_audio_dir=TTS_AUDIO_DIR)
 logger.info("TTS处理器初始化完成")
 
-# Call Ollama API to generate questions
+# Call Ollama local API to generate questions
 def chat_with_ollama(messages):
-    data = {"model": "phi4:latest", "messages": messages, "stream": False}
+    data = {
+        "model": OLLAMA_LLM_NAME, 
+        "messages": messages, 
+        "stream": False
+    }
     try:
         response = requests.post(OLLAMA_API_URL, json=data)
         response.raise_for_status()
         response_data = response.json()
         if "message" in response_data and "content" in response_data["message"]:
-            return response_data["message"]["content"]
+            content = response_data["message"]["content"]
+            # 添加日志记录生成的问题
+            logger.info(f"Ollama生成的问题: {content}")
+            return content
         logger.error("Unexpected response format: %s", response_data)
         return None
     except requests.exceptions.RequestException as e:
@@ -170,9 +184,17 @@ async def process_audio(websocket, path):
         logger.info(f"开始异步生成问题: {time.strftime('%H:%M:%S', time.localtime(start_gen_time))}")
 
         # 异步生成后续问题，不阻塞主线程
-        _, new_tasks = await tts_processor.generate_all_questions_async(
-            chat_with_ollama, conversation_history, question_counter, MAX_QUESTIONS, tts_queue
+        questions, new_tasks = await tts_processor.generate_all_questions_async(
+            chat_with_ollama, 
+            conversation_history, 
+            question_counter, 
+            MAX_QUESTIONS, 
+            tts_queue
         )
+        
+        # 添加日志记录所有生成的问题
+        if questions:
+            logger.info(f"异步生成的所有问题: {questions}")
         
         end_gen_time = time.time()
         gen_duration = end_gen_time - start_gen_time
@@ -203,8 +225,8 @@ async def process_audio(websocket, path):
                     logger.info(f"收到客户端消息，类型: {type(message)}")
                 
                 # 处理客户端发送的停止说话信号
-                if message == "USER_STOPPED_SPEAKING":
-                    logger.info("收到用户停止说话信号，进行最终转录")
+                if message == "USER_STOPPED_SPEAKING" or message == "SILENCE_DETECTED":
+                    logger.info(f"收到{message}信号，进行最终转录")
                     
                     # 如果缓冲区有足够的音频数据，进行最终转录
                     if len(audio_buffer) >= MIN_AUDIO_BUFFER_SIZE and awaiting_response:
@@ -304,7 +326,9 @@ async def process_audio(websocket, path):
                 if not is_playing_audio:
                     # 检查消息是否为二进制数据
                     if not isinstance(message, bytes):
-                        logger.warning(f"收到非二进制数据: {message} 。我们期待的是二进制音频数据，跳过。")
+                        # 修改这里，不再简单地跳过非二进制数据
+                        if message != "SILENCE_DETECTED":  # 已经在上面处理了SILENCE_DETECTED
+                            logger.warning(f"收到非二进制数据: {message} 。我们期待的是二进制音频数据，跳过。")
                         continue
 
                     logger.info(f"收到客户端音频数据，大小: {len(message)} 字节")

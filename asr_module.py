@@ -66,8 +66,15 @@ class ASRProcessor:
         except Exception as e:
             logger.warning(f"清理调试文件时出错: {e}")
 
-    def transcribe(self, audio_data, beam_size=3, language=None):
-        """转录音频数据"""
+    def transcribe(self, audio_data, beam_size=3, language=None, translate=False):
+        """
+            转录音频数据
+            audio_data: 音频数据，numpy数组
+            beam_size: beam search大小
+            language: 指定语言代码，如"zh"表示中文，"en"表示英文，None表示自动检测
+            translate: 是否翻译为英文
+        """
+
         try:
             # 添加音频数据的调试信息
             logger.info(f"开始转录音频: 长度={len(audio_data)} 样本, 最大值={np.max(np.abs(audio_data))}")
@@ -107,7 +114,8 @@ class ASRProcessor:
             segments, info = self.model.transcribe(
                 audio_data, 
                 beam_size=max(beam_size, 5), 
-                language=language or "zh"
+                language=language,
+                task="translate" if translate else "transcribe"  # 添加翻译选项
             )
             
             # 收集所有文本片段
@@ -138,7 +146,7 @@ class ASRProcessor:
             
             # 保存转录前的音频片段
             self.save_debug_audio(recent_audio, prefix="segment")
-            
+
             segments, info = self.model.transcribe(recent_audio, beam_size=beam_size, language=language)
             transcription = " ".join(segment.text for segment in segments)
             
