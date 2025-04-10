@@ -21,6 +21,41 @@ class TTSProcessor:
             os.makedirs(self.tts_audio_dir)
             
         logger.info(f"TTS处理器初始化完成，API地址: {tts_api_url}")
+
+    def check_questions_ready(self, questions_dir, num_questions):
+        """检查指定数量的问题是否已经生成完毕"""
+        try:
+            # 检查目录是否存在
+            if not os.path.exists(questions_dir):
+                logger.warning(f"问题目录不存在: {questions_dir}")
+                return False
+                
+            # 检查每个问题文件是否存在
+            for i in range(2, num_questions + 1):
+                question_file = os.path.join(questions_dir, f"question_{i}.wav")
+                if not os.path.exists(question_file):
+                    logger.info(f"问题文件不存在: {question_file}")
+                    return False
+            
+            logger.info(f"所有 {num_questions} 个问题已准备就绪")
+            return True
+        except Exception as e:
+            logger.error(f"检查问题状态时出错: {e}")
+            return False
+    
+    def count_existing_questions(self, questions_dir):
+        """计算已存在的问题数量"""
+        try:
+            if not os.path.exists(questions_dir):
+                return 0
+                
+            # 计算问题_*.wav文件的数量
+            question_files = [f for f in os.listdir(questions_dir) 
+                             if f.startswith("question_") and f.endswith(".wav")]
+            return len(question_files)
+        except Exception as e:
+            logger.error(f"计算问题数量时出错: {e}")
+            return 0        
     
     async def generate_audio_async(self, text, filename, tts_queue=None, task_id=None):
         """异步生成TTS音频并可选择将结果放入队列"""

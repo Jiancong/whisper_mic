@@ -15,20 +15,25 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration parameters
-OLLAMA_LLM_NAME= "qwen2.5-coder:14b"
+OLLAMA_LLM_NAME= "gemma3:12b"
 OLLAMA_API_URL = "http://localhost:11434/api/chat"  # Ollama API endpoint
 TTS_API_URL = "http://localhost:5000/generate"  # TTS service endpoint
+QUESTION_GEN_API_URL = "http://localhost:5001/questions_status"  # 问题生成服务API
+
 SAMPLE_RATE = 16000  # Audio sample rate
-TTS_PREDEFINED_AUDIO_DIR = "./tts_predefined_audio"  # Predefined TTS audio directory
-TTS_AUDIO_DIR = "./tts_audio"  # Generated TTS audio directory
+TTS_PREDEFINED_AUDIO_DIR = "tts_predefined_audio"  # Predefined TTS audio directory
+TTS_AUDIO_DIR = "tts_audio"  # Generated TTS audio directory
 INTERVIEWER_NAME = "elon_musk"  # Interviewer subdirectory name
 MIN_RESPONSE_LENGTH = 20  # Minimum response length (characters)
 TIMEOUT_SECONDS = 60  # 增加超时时间从20秒到60秒
-MAX_QUESTIONS = 0  # Maximum number of questions
+MAX_QUESTIONS = 2  # Maximum number of questions
 TRANSCRIPTION_INTERVAL = 3  # 增加转录间隔时间，从2秒到5秒
 MIN_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 3  # 至少需要5秒的音频才开始转录，而不是0.1秒
 MAX_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 120  # 最多保留120秒的音频数据，从60秒增加到120秒
 SILENCE_THRESHOLD = 0.0005  # 静音检测阈值，降低以捕获更多音频
+
+QUESTIONS_CHECK_INTERVAL = 2  # 检查问题生成状态的间隔（秒）
+MAX_WAIT_TIME = 300  # 最长等待问题生成的时间（秒）
 
 # Predefined audio file paths
 QUESTION_1_FILE = os.path.join(TTS_PREDEFINED_AUDIO_DIR, INTERVIEWER_NAME, "question_1.wav")
@@ -71,6 +76,74 @@ logger.info("ASR处理器初始化完成")
 # 初始化TTS处理器
 tts_processor = TTSProcessor(tts_api_url=TTS_API_URL, tts_audio_dir=TTS_AUDIO_DIR)
 logger.info("TTS处理器初始化完成")
+
+
+# 检查问题生成状态
+async def check_questions_ready(tts_queue):
+    """检查问题是否已生成完毕"""
+    try:
+        # 首先检查本地文件，第1个问题放在预定目录，不需要检测
+        if MAX_QUESTIONS > 1 and tts_processor.check_questions_ready(TTS_AUDIO_DIR, MAX_QUESTIONS + 1):
+            logger.info("本地文件已准备就绪，将使用本地文件")
+            return True
+        elif MAX_QUESTIONS <= 1 and os.path.exists(QUESTION_1_FILE) :
+            logger.info("本地文件已准备就绪，将使用本地文件")
+            return True
+        else:
+            logger.info("本地文件不完整，将尝试通过API检查")
+
+
+        question_counter = 2
+        while question_counter <= MAX_QUESTIONS:
+            audio_file_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
+            if not os.path.exists(audio_file_path):
+                logger.warning(f"问题文件不存在: {audio_file_path}")
+                return False
+            
+            # 异步生成后续问题，不阻塞主线程
+            questions, new_tasks = await tts_processor.generate_all_questions_async(
+                chat_with_ollama, 
+                conversation_history, 
+                question_counter, 
+                MAX_QUESTIONS, 
+                tts_queue
+            )       
+            question_counter += 1    
+
+    except Exception as e:
+        logger.error(f"检查问题状态时出错: {e}")
+        return False
+
+# 等待问题生成完毕
+async def wait_for_questions(websocket, tts_queue):
+    """等待问题生成完毕，并通知客户端进度"""
+    start_time = time.time()
+    
+    # 发送初始状态消息
+    await websocket.send("STATUS: 正在准备面试问题，请稍候...")
+    
+    while True:
+        # 检查是否超时
+        if time.time() - start_time > MAX_WAIT_TIME:
+            logger.warning(f"等待问题生成超时 ({MAX_WAIT_TIME}秒)")
+            await websocket.send("STATUS: 问题生成超时，将使用已有问题继续")
+            return False
+            
+        # 检查问题是否已生成完毕
+        if await check_questions_ready(tts_queue):
+            await websocket.send("STATUS: 面试问题已准备就绪，即将开始面试")
+            return True
+            
+        # 获取当前已生成的问题数量
+        current_count = tts_processor.count_existing_questions(TTS_AUDIO_DIR)
+        total_count = MAX_QUESTIONS + 1
+        
+        # 发送进度消息
+        progress = min(100, int(current_count / total_count * 100))
+        await websocket.send(f"STATUS: 正在准备面试问题 ({current_count}/{total_count})... {progress}%")
+        
+        # 等待一段时间再检查
+        await asyncio.sleep(QUESTIONS_CHECK_INTERVAL)
 
 # Call Ollama local API to generate questions
 def chat_with_ollama(messages):
@@ -146,16 +219,22 @@ async def process_audio(websocket, path):
     global conversation_history
 
     logger.info("Connected to client!")
+    # 创建TTS结果队列
+    tts_queue = asyncio.Queue()
+    tts_tasks = []
+
+    # 等待问题生成完毕
+    # logger.info("等待问题生成完毕...")
+    # questions_ready = await wait_for_questions(websocket, tts_queue)
+    # if not questions_ready:
+    #     logger.warning("问题未完全生成，但将继续使用已有问题")
+
     audio_buffer = np.array([], dtype=np.float32)
     question_counter = 1
     is_playing_audio = False
     awaiting_response = False
     last_transcription_time = 0
     last_complete_transcription = ""  # 记录上一次完整转录结果
-    
-    # 创建TTS结果队列
-    tts_queue = asyncio.Queue()
-    tts_tasks = []
 
     try:
         # Check if predefined audio directory and files exist
