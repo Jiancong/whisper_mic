@@ -61,7 +61,7 @@ My main skills:
 conversation_history = [
     {
         "role": "system", 
-        "content": "You are an interviewer asking technical questions based on the candidate's resume. Ask one concise question at a time, max 10-20 words, one sentence only."
+        "content": "You are an interviewer asking technical questions based on the candidate's resume. Ask one concise question at a time, max 10 words, one sentence only."
     },
     {
         "role": "user", 
@@ -77,6 +77,8 @@ logger.info("ASR处理器初始化完成")
 tts_processor = TTSProcessor(tts_api_url=TTS_API_URL, tts_audio_dir=TTS_AUDIO_DIR)
 logger.info("TTS处理器初始化完成")
 
+# 在文件顶部添加一个新的常量
+SILENCE_ANALYSIS_THRESHOLD = 5  # 静音5秒后分析用户回答状态
 
 # 检查问题生成状态
 async def check_questions_ready(tts_queue):
@@ -223,18 +225,23 @@ async def process_audio(websocket, path):
     tts_queue = asyncio.Queue()
     tts_tasks = []
 
-    # 等待问题生成完毕
-    # logger.info("等待问题生成完毕...")
-    # questions_ready = await wait_for_questions(websocket, tts_queue)
-    # if not questions_ready:
-    #     logger.warning("问题未完全生成，但将继续使用已有问题")
-
     audio_buffer = np.array([], dtype=np.float32)
     question_counter = 1
     is_playing_audio = False
     awaiting_response = False
     last_transcription_time = 0
     last_complete_transcription = ""  # 记录上一次完整转录结果
+
+    # 添加新变量
+    current_question = "Can you briefly introduce yourself?"  # 默认第一个问题
+    last_silence_analysis_time = 0  # 上次分析用户回答状态的时间
+    silence_start_time = None  # 静音开始时间
+    is_silence = False  # 当前是否处于静音状态
+    
+    # 添加新变量，用于跟踪连续静音检测次数和是否已发送更多细节提示
+    consecutive_silence_count = 0  # 连续静音检测次数
+    more_details_sent = False  # 是否已发送更多细节提示
+    current_question_id = 1  # 当前问题ID，用于跟踪问题变化
 
     try:
         # Check if predefined audio directory and files exist
@@ -258,31 +265,6 @@ async def process_audio(websocket, path):
         awaiting_response = True
         question_counter += 1
 
-        # 添加时间监控代码
-        start_gen_time = time.time()
-        logger.info(f"开始异步生成问题: {time.strftime('%H:%M:%S', time.localtime(start_gen_time))}")
-
-        # 异步生成后续问题，不阻塞主线程
-        questions, new_tasks = await tts_processor.generate_all_questions_async(
-            chat_with_ollama, 
-            conversation_history, 
-            question_counter, 
-            MAX_QUESTIONS, 
-            tts_queue
-        )
-        
-        # 添加日志记录所有生成的问题
-        if questions:
-            logger.info(f"异步生成的所有问题: {questions}")
-        
-        end_gen_time = time.time()
-        gen_duration = end_gen_time - start_gen_time
-        logger.info(f"异步问题生成函数返回用时: {gen_duration:.2f}秒")
-        logger.info(f"返回时间: {time.strftime('%H:%M:%S', time.localtime(end_gen_time))}")
-
-        tts_tasks.extend(new_tasks)
-        logger.info(f"已创建 {len(new_tasks)} 个TTS生成任务")
-
         start_time = time.time()  # Record start time for timeout
         silence_counter = 0  # 静音计数器
         last_audio_time = time.time()  # 上次接收到有效音频的时间
@@ -296,8 +278,6 @@ async def process_audio(websocket, path):
                 start_time = time.time()
                 # 记录当前超时设置
                 logger.debug(f"当前超时设置: {TIMEOUT_SECONDS}秒, 剩余时间: {TIMEOUT_SECONDS - (time.time() - start_time):.2f}秒")
-
-                # logger.info(f"收到客户端消息: {message}")
                 
                 # 只在收到非二进制数据或首次连接时输出详细日志
                 if isinstance(message, str) or audio_buffer.size == 0:
@@ -306,6 +286,73 @@ async def process_audio(websocket, path):
                 # 处理客户端发送的停止说话信号
                 if message == "USER_STOPPED_SPEAKING" or message == "SILENCE_DETECTED":
                     logger.info(f"收到{message}信号，进行最终转录")
+                    
+                    # 如果收到SILENCE_DETECTED信号，增加连续静音计数
+                    if message == "SILENCE_DETECTED" and more_details_sent:
+                        consecutive_silence_count += 1
+                        logger.info(f"连续静音计数: {consecutive_silence_count}/3")
+                        
+                        # 如果连续三次检测到静音，且已经发送过更多细节提示，则认为用户已完成回答
+                        if consecutive_silence_count >= 3:
+                            logger.info("连续三次检测到静音，认为用户已完成回答，准备进入下一个问题")
+                            
+                            # 进行最终转录
+                            if len(audio_buffer) >= MIN_AUDIO_BUFFER_SIZE:
+                                transcription, _ = asr_processor.transcribe(audio_buffer, beam_size=5)
+                                
+                                if transcription and len(transcription) > 0:
+                                    logger.info(f"最终转录结果: {transcription}")
+                                    await websocket.send(f"TRANSCRIPTION: {transcription}")
+                                    
+                                    # 将用户回答添加到对话历史
+                                    conversation_history.append({"role": "user", "content": transcription})
+                            
+                            # 重置连续静音计数和更多细节标志
+                            consecutive_silence_count = 0
+                            more_details_sent = False
+                            
+                            # 生成下一个问题
+                            if question_counter <= MAX_QUESTIONS:
+                                logger.info("根据用户回答生成下一个问题...")
+                                
+                                # 生成下一个问题
+                                next_question = chat_with_ollama(conversation_history)
+                                
+                                if next_question:
+                                    logger.info(f"生成的下一个问题: {next_question}")
+                                    
+                                    # 添加到对话历史
+                                    conversation_history.append({"role": "assistant", "content": next_question})
+                                    current_question = next_question
+                                    current_question_id = question_counter  # 更新当前问题ID
+                                    
+                                    # 生成TTS音频
+                                    next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
+                                    success = await tts_processor.generate_tts(next_question, next_audio_path)
+                                    
+                                    if success:
+                                        logger.info(f"已生成问题音频: {next_audio_path}")
+                                        await tts_processor.send_audio(websocket, next_audio_path)
+                                        logger.info(f"已发送下一个问题: {next_question}")
+                                        
+                                        awaiting_response = True
+                                        question_counter += 1
+                                        # 清空音频缓冲区，准备接收下一个回答
+                                        audio_buffer = np.array([], dtype=np.float32)
+                                    else:
+                                        logger.error("TTS生成失败，使用预定义的更多细节音频")
+                                        await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                else:
+                                    logger.error("问题生成失败，使用预定义的更多细节音频")
+                                    await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                            else:
+                                logger.info("已达到最大问题数量，结束面试")
+                                await websocket.send("All questions have been asked. Thank you for the interview!")
+                                # 播放结束音频
+                                await tts_processor.send_audio(websocket, BYE_FILE)
+                                break
+                            
+                            continue
                     
                     # 如果缓冲区有足够的音频数据，进行最终转录
                     if len(audio_buffer) >= MIN_AUDIO_BUFFER_SIZE and awaiting_response:
@@ -319,43 +366,86 @@ async def process_audio(websocket, path):
                             logger.info(f"最终转录结果: {transcription}")
                             await websocket.send(f"TRANSCRIPTION: {transcription}")
                             
-                            # 如果转录内容足够长，处理用户回答
-                            if len(transcription) >= MIN_RESPONSE_LENGTH:
+                            # 分析用户回答状态
+                            response_status, explanation = await tts_processor.analyze_user_response(
+                                transcription, 
+                                current_question, 
+                                chat_with_ollama
+                            )
+                            
+                            logger.info(f"用户回答状态: {response_status} - {explanation}")
+                            
+                            # 根据回答状态采取不同行动
+                            if response_status == 1:  # 用户没有回答问题
+                                logger.info("用户没有回答问题，重新提问")
+                                await websocket.send("STATUS: 请回答当前问题")
+                                # 可以选择重新播放问题
+                                
+                            elif response_status == 2:  # 用户正在思考，回答未结束
+                                logger.info("用户回答未结束，发送更多细节提示")
+                                await websocket.send("STATUS: 请继续您的回答")
+                                
+                                # 如果还没有发送过更多细节提示，则发送
+                                if not more_details_sent:
+                                    logger.info("发送更多细节提示音频")
+                                    await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                    more_details_sent = True
+                                    # 重置连续静音计数
+                                    consecutive_silence_count = 0
+                                
+                            elif response_status == 3:  # 用户已完成回答
+                                logger.info("用户已完成回答，准备下一个问题")
+                                # 将用户回答添加到对话历史
                                 conversation_history.append({"role": "user", "content": transcription})
                                 
-                                # 检查队列中是否有准备好的TTS音频
-                                try:
-                                    next_audio_path, question_text = await asyncio.wait_for(tts_queue.get(), timeout=0.1)
-                                    logger.info(f"使用队列中的下一个问题: {question_text}")
-                                    await tts_processor.send_audio(websocket, next_audio_path)
-                                    logger.info(f"Sent next question: {next_audio_path}")
-
-                                    awaiting_response = True
-                                    question_counter += 1
-                                except (asyncio.QueueEmpty, asyncio.TimeoutError):
-                                    # 如果队列为空，检查文件系统
-                                    next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
-                                    if os.path.exists(next_audio_path):
-                                        await tts_processor.send_audio(websocket, next_audio_path)
-                                        logger.info(f"Sent next question from file: {next_audio_path}")
-
-                                        awaiting_response = True
-                                        question_counter += 1
-                                    else:
-                                        logger.info("No more questions available. Ending interview.")
-                                        await websocket.send("All questions have been asked. Thank you for the interview!")
-                                        break
+                                # 重置连续静音计数和更多细节标志
+                                consecutive_silence_count = 0
+                                more_details_sent = False
+                                
+                                # 根据用户回答生成下一个问题
+                                if question_counter <= MAX_QUESTIONS:
+                                    logger.info("根据用户回答生成下一个问题...")
+                                    
+                                    # 生成下一个问题
+                                    next_question = chat_with_ollama(conversation_history)
+                                    
+                                    if next_question:
+                                        logger.info(f"生成的下一个问题: {next_question}")
                                         
-                                # 清空音频缓冲区，准备接收下一个回答
-                                audio_buffer = np.array([], dtype=np.float32)
-                                start_time = time.time()  # Reset timeout after valid response
+                                        # 添加到对话历史
+                                        conversation_history.append({"role": "assistant", "content": next_question})
+                                        current_question = next_question
+                                        current_question_id = question_counter  # 更新当前问题ID
+                                        
+                                        # 生成TTS音频
+                                        next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
+                                        success = await tts_processor.generate_tts(next_question, next_audio_path)
+                                        
+                                        if success:
+                                            logger.info(f"已生成问题音频: {next_audio_path}")
+                                            await tts_processor.send_audio(websocket, next_audio_path)
+                                            logger.info(f"已发送下一个问题: {next_question}")
+                                            
+                                            awaiting_response = True
+                                            question_counter += 1
+                                            # 清空音频缓冲区，准备接收下一个回答
+                                            audio_buffer = np.array([], dtype=np.float32)
+                                        else:
+                                            logger.error("TTS生成失败，使用预定义的更多细节音频")
+                                            await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                    else:
+                                        logger.error("问题生成失败，使用预定义的更多细节音频")
+                                        await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                else:
+                                    logger.info("已达到最大问题数量，结束面试")
+                                    await websocket.send("All questions have been asked. Thank you for the interview!")
+                                    # 播放结束音频
+                                    await tts_processor.send_audio(websocket, BYE_FILE)
+                                    break
+                                
+                                # 重置超时计时器
+                                start_time = time.time()
                                 silence_counter = 0
-                            else:
-                                logger.info(f"最终转录结果太短 ({len(transcription)} 字符)，发送more_details.wav")
-                                await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
-                                awaiting_response = True
-                                # 清空音频缓冲区，准备接收新的回答
-                                audio_buffer = np.array([], dtype=np.float32)
                         else:
                             logger.info("最终转录结果为空，继续等待用户输入")
                     
@@ -381,6 +471,113 @@ async def process_audio(websocket, path):
                         if len(audio_buffer) > MAX_AUDIO_BUFFER_SIZE:
                             audio_buffer = audio_buffer[-MAX_AUDIO_BUFFER_SIZE:]
 
+                        # 检测是否为有效音频（非静音）
+                        current_is_silence = np.mean(np.abs(audio_chunk)) < SILENCE_THRESHOLD
+                        current_time = time.time()
+                        
+                        # 静音状态转换逻辑
+                        if current_is_silence and not is_silence:
+                            # 从有声音变为静音
+                            is_silence = True
+                            silence_start_time = current_time
+                            logger.debug("检测到静音开始")
+                        elif not current_is_silence:
+                            # 有声音，重置静音状态
+                            is_silence = False
+                            silence_start_time = None
+                            logger.debug("检测到声音，重置静音状态")
+                        
+                        # 如果持续静音超过阈值且有足够的转录内容，分析用户回答状态
+                        if (is_silence and silence_start_time and 
+                                current_time - silence_start_time >= SILENCE_ANALYSIS_THRESHOLD and
+                                current_time - last_silence_analysis_time >= SILENCE_ANALYSIS_THRESHOLD and
+                                len(audio_buffer) >= MIN_AUDIO_BUFFER_SIZE and awaiting_response):
+                            
+                            # 更新上次分析时间
+                            last_silence_analysis_time = current_time
+                            
+                            # 进行转录
+                            transcription, _ = asr_processor.transcribe(audio_buffer, beam_size=5)
+                            
+                            if transcription and len(transcription) > 0:
+                                logger.info(f"静音分析转录: {transcription}")
+                                await websocket.send(f"TRANSCRIPTION: {transcription}")
+                                
+                                # 分析用户回答状态
+                                response_status, explanation = await tts_processor.analyze_user_response(
+                                    transcription, 
+                                    current_question, 
+                                    chat_with_ollama
+                                )
+                                
+                                logger.info(f"静音期间用户回答状态: {response_status} - {explanation}")
+                                
+                                # 根据回答状态采取不同行动
+                                if response_status == 1:  # 用户没有回答问题
+                                    # 如果用户没有回答问题，但已经有一些内容，可能是在组织语言
+                                    if len(transcription) > 10:
+                                        await websocket.send("STATUS: 请继续回答问题")
+                                    else:
+                                        await websocket.send("STATUS: 请回答当前问题")
+                                    
+                                elif response_status == 2:  # 用户正在思考，回答未结束
+                                    # 如果还没有发送过更多细节提示，则发送
+                                    if not more_details_sent:
+                                        logger.info("发送更多细节提示音频")
+                                        await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                        more_details_sent = True
+                                        # 重置连续静音计数
+                                        consecutive_silence_count = 0
+                                    
+                                elif response_status == 3:  # 用户已完成回答
+                                    logger.info("用户已完成回答，准备下一个问题")
+                                    # 将用户回答添加到对话历史
+                                    conversation_history.append({"role": "user", "content": transcription})
+                                    
+                                    # 重置连续静音计数和更多细节标志
+                                    consecutive_silence_count = 0
+                                    more_details_sent = False
+                                    
+                                    # 根据用户回答生成下一个问题
+                                    if question_counter <= MAX_QUESTIONS:
+                                        logger.info("根据用户回答生成下一个问题...")
+                                        
+                                        # 生成下一个问题
+                                        next_question = chat_with_ollama(conversation_history)
+                                        
+                                        if next_question:
+                                            logger.info(f"生成的下一个问题: {next_question}")
+                                            
+                                            # 添加到对话历史
+                                            conversation_history.append({"role": "assistant", "content": next_question})
+                                            current_question = next_question
+                                            current_question_id = question_counter  # 更新当前问题ID
+                                            
+                                            # 生成TTS音频
+                                            next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
+                                            success = await tts_processor.generate_tts(next_question, next_audio_path)
+                                            
+                                            if success:
+                                                logger.info(f"已生成问题音频: {next_audio_path}")
+                                                await tts_processor.send_audio(websocket, next_audio_path)
+                                                logger.info(f"已发送下一个问题: {next_question}")
+                                                
+                                                awaiting_response = True
+                                                question_counter += 1
+                                                # 清空音频缓冲区，准备接收下一个回答
+                                                audio_buffer = np.array([], dtype=np.float32)
+                                            else:
+                                                logger.error("TTS生成失败，使用预定义的更多细节音频")
+                                                await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                        else:
+                                            logger.error("问题生成失败，使用预定义的更多细节音频")
+                                            await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                    else:
+                                        logger.info("已达到最大问题数量，结束面试")
+                                        await websocket.send("All questions have been asked. Thank you for the interview!")
+                                        # 播放结束音频
+                                        await tts_processor.send_audio(websocket, BYE_FILE)
+                                        break
 
                         # 重置超时计时器，只要收到音频数据就刷新
                         start_time = time.time()
@@ -416,24 +613,115 @@ async def process_audio(websocket, path):
                         logger.warning("收到空音频块, 跳过重听")
                         continue
 
-                    # # 检测是否为有效音频（非静音）
-                    # is_silent = np.mean(np.abs(audio_chunk)) < SILENCE_THRESHOLD
+                    # 检测是否为有效音频（非静音）
+                    current_is_silence = np.mean(np.abs(audio_chunk)) < SILENCE_THRESHOLD
+                    current_time = time.time()
                     
-                    # if is_silent:
-                    #     silence_counter += 1
-                    #     # 每10个静音帧输出一次日志
-                    #     if silence_counter % 10 == 0:
-                    #         logger.debug(f"检测到静音帧 ({silence_counter})")
-                    # else:
-                    #     # 重置静音计数器并更新最后有效音频时间
-                    #     silence_counter = 0
-                    #     last_audio_time = time.time()
+                    # 静音状态转换逻辑
+                    if current_is_silence and not is_silence:
+                        # 从有声音变为静音
+                        is_silence = True
+                        silence_start_time = current_time
+                        logger.debug("检测到静音开始")
+                    elif not current_is_silence:
+                        # 有声音，重置静音状态
+                        is_silence = False
+                        silence_start_time = None
+                        logger.debug("检测到声音，重置静音状态")
                     
-                    #logger.info("开始降噪")
-                    # 使用ASR模块进行降噪，但保留更多原始信号
-                    #denoised_chunk = asr_processor.denoise_audio(audio_chunk)
+                    # 如果持续静音超过阈值且有足够的转录内容，分析用户回答状态
+                    if (is_silence and silence_start_time and 
+                            current_time - silence_start_time >= SILENCE_ANALYSIS_THRESHOLD and
+                            current_time - last_silence_analysis_time >= SILENCE_ANALYSIS_THRESHOLD and
+                            len(audio_buffer) >= MIN_AUDIO_BUFFER_SIZE and awaiting_response):
+                        
+                        # 更新上次分析时间
+                        last_silence_analysis_time = current_time
+                        
+                        # 进行转录
+                        transcription, _ = asr_processor.transcribe(audio_buffer, beam_size=5)
+                        
+                        if transcription and len(transcription) > 0:
+                            logger.info(f"静音分析转录: {transcription}")
+                            await websocket.send(f"TRANSCRIPTION: {transcription}")
+                            
+                            # 分析用户回答状态
+                            response_status, explanation = await tts_processor.analyze_user_response(
+                                transcription, 
+                                current_question, 
+                                chat_with_ollama
+                            )
+                            
+                            logger.info(f"静音期间用户回答状态: {response_status} - {explanation}")
+                            
+                            # 根据回答状态采取不同行动
+                            if response_status == 1:  # 用户没有回答问题
+                                # 如果用户没有回答问题，但已经有一些内容，可能是在组织语言
+                                if len(transcription) > 10:
+                                    await websocket.send("STATUS: 请继续回答问题")
+                                else:
+                                    await websocket.send("STATUS: 请回答当前问题")
+                                
+                            elif response_status == 2:  # 用户正在思考，回答未结束
+                                # 如果还没有发送过更多细节提示，则发送
+                                if not more_details_sent:
+                                    logger.info("发送更多细节提示音频")
+                                    await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                    more_details_sent = True
+                                    # 重置连续静音计数
+                                    consecutive_silence_count = 0
+                                
+                            elif response_status == 3:  # 用户已完成回答
+                                logger.info("用户已完成回答，准备下一个问题")
+                                # 将用户回答添加到对话历史
+                                conversation_history.append({"role": "user", "content": transcription})
+                                
+                                # 重置连续静音计数和更多细节标志
+                                consecutive_silence_count = 0
+                                more_details_sent = False
+                                
+                                # 根据用户回答生成下一个问题
+                                if question_counter <= MAX_QUESTIONS:
+                                    logger.info("根据用户回答生成下一个问题...")
+                                    
+                                    # 生成下一个问题
+                                    next_question = chat_with_ollama(conversation_history)
+                                    
+                                    if next_question:
+                                        logger.info(f"生成的下一个问题: {next_question}")
+                                        
+                                        # 添加到对话历史
+                                        conversation_history.append({"role": "assistant", "content": next_question})
+                                        current_question = next_question
+                                        current_question_id = question_counter  # 更新当前问题ID
+                                        
+                                        # 生成TTS音频
+                                        next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
+                                        success = await tts_processor.generate_tts(next_question, next_audio_path)
+                                        
+                                        if success:
+                                            logger.info(f"已生成问题音频: {next_audio_path}")
+                                            await tts_processor.send_audio(websocket, next_audio_path)
+                                            logger.info(f"已发送下一个问题: {next_question}")
+                                            
+                                            awaiting_response = True
+                                            question_counter += 1
+                                            # 清空音频缓冲区，准备接收下一个回答
+                                            audio_buffer = np.array([], dtype=np.float32)
+                                        else:
+                                            logger.error("TTS生成失败，使用预定义的更多细节音频")
+                                            await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                    else:
+                                        logger.error("问题生成失败，使用预定义的更多细节音频")
+                                        await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                else:
+                                    logger.info("已达到最大问题数量，结束面试")
+                                    await websocket.send("All questions have been asked. Thank you for the interview!")
+                                    # 播放结束音频
+                                    await tts_processor.send_audio(websocket, BYE_FILE)
+                                    break
+                    
                     denoised_chunk = audio_chunk
-                    #logger.info("降噪完成")
 
                     # 限制音频缓冲区大小，防止内存溢出
                     if len(audio_buffer) > MAX_AUDIO_BUFFER_SIZE:
@@ -447,78 +735,6 @@ async def process_audio(websocket, path):
                     logger.info("开始实时转录操作并检查转录内容是否够长")
                     # 实时转录 - 更频繁地进行转录
                     last_transcription_time = await transcribe_periodically(websocket, audio_buffer, last_transcription_time)
-
-                    # 检查是否有足够长的转录内容可以处理
-                    # 当音频缓冲区足够长或者静音持续一段时间后进行完整转录
-                    should_transcribe = (
-                        len(audio_buffer) > MIN_AUDIO_BUFFER_SIZE * 2 and awaiting_response and
-                        (len(audio_buffer) >= SAMPLE_RATE * 3 or  # 至少3秒音频
-                         (silence_counter > 5 and time.time() - last_audio_time > 1.0))  # 或1秒静音
-                    )
-                    
-                    if should_transcribe:
-                        logger.info("应该进行转录")
-                        last_transcription_time = time.time()
-                        # 使用ASR模块进行完整转录，增加参数提高准确性
-                        transcription, _ = asr_processor.transcribe(
-                            audio_buffer, 
-                            beam_size=5
-                        )
-                        
-                        # 如果转录结果与上次相同，可能是没有新内容，跳过处理
-                        if transcription == last_complete_transcription and len(transcription) > 0:
-                            logger.debug("转录结果与上次相同，跳过处理")
-                            continue
-                            
-                        last_complete_transcription = transcription
-                        logger.info(f"完整转录: {transcription}")
-                        
-                        # 发送完整转录文本回客户端
-                        await websocket.send(f"TRANSCRIPTION: {transcription}")
-
-                        logger.info(f"len of transcription: {len(transcription)}")
-
-                        # 检查响应长度
-                        if len(transcription) >= MIN_RESPONSE_LENGTH:
-                            conversation_history.append({"role": "user", "content": transcription})
-                            
-                            # 检查队列中是否有准备好的TTS音频
-                            try:
-                                next_audio_path, question_text = await asyncio.wait_for(tts_queue.get(), timeout=0.1)
-                                logger.info(f"使用队列中的下一个问题: {question_text}")
-                                await tts_processor.send_audio(websocket, next_audio_path)
-                                logger.info(f"Sent next question: {next_audio_path}")
-
-                                awaiting_response = True
-                                question_counter += 1
-                            except (asyncio.QueueEmpty, asyncio.TimeoutError):
-                                # 如果队列为空，检查文件系统
-                                next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
-                                if os.path.exists(next_audio_path):
-                                    await tts_processor.send_audio(websocket, next_audio_path)
-                                    logger.info(f"Sent next question from file: {next_audio_path}")
-
-                                    awaiting_response = True
-                                    question_counter += 1
-                                else:
-                                    logger.info("No more questions available. Ending interview.")
-                                    await websocket.send("All questions have been asked. Thank you for the interview!")
-                                    break
-                                    
-                            # 清空音频缓冲区，准备接收下一个回答
-                            audio_buffer = np.array([], dtype=np.float32)
-                            start_time = time.time()  # Reset timeout after valid response
-                            silence_counter = 0
-                        else:
-                            # 不要立即发送more_details，给用户更多时间继续说话
-                            if len(transcription) > 0 and len(audio_buffer) < SAMPLE_RATE * 10:  # 如果有内容但不够长，且音频不超过10秒，继续等待
-                                continue
-                            
-                            logger.info(f"Response too short ({len(transcription)} chars), sending more_details.wav")
-                            await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
-
-                            awaiting_response = True  # Continue awaiting a longer response
-                            # 不清空音频缓冲区，保留已收集的音频
 
                 # Check for timeout
                 if time.time() - start_time > TIMEOUT_SECONDS:

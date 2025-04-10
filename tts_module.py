@@ -15,6 +15,7 @@ class TTSProcessor:
         self.tts_audio_dir = tts_audio_dir
         self.ref_audio = ref_audio
         self.ref_text = ref_text
+        self.nfe_step = 16 # default is 32
         
         # 确保音频目录存在
         if not os.path.exists(self.tts_audio_dir):
@@ -69,7 +70,8 @@ class TTSProcessor:
                 json={
                     "ref_audio": self.ref_audio,
                     "ref_text": self.ref_text,
-                    "gen_text": text
+                    "gen_text": text,
+                    "nfe_step": self.nfe_step,
                 }
             )
             response.raise_for_status()
@@ -231,3 +233,84 @@ class TTSProcessor:
                 
         except Exception as e:
             logger.error(f"任务监控器错误: {e}")
+
+# ... existing code ...
+
+    async def analyze_user_response(self, transcription, current_question, chat_function):
+        """分析用户回答状态
+        返回值:
+        1 - 用户没有回答问题
+        2 - 用户正在思考，回答未结束
+        3 - 用户已完成回答
+        """
+        try:
+            # 构建分析提示
+            prompt = [
+                {
+                    "role": "system",
+                    "content": "你是一个面试助手，负责分析用户的回答是否完整。请根据问题和回答内容，判断用户的回答状态。"
+                },
+                {
+                    "role": "user",
+                    "content": f"问题: {current_question}\n\n用户回答: {transcription}\n\n请分析用户回答状态，并返回以下三种状态之一:\n1 - 用户没有回答问题\n2 - 用户正在思考，回答未结束\n3 - 用户已完成回答\n\n只需返回数字和简短解释，格式为: '状态数字:解释'"
+                }
+            ]
+            
+            # 调用LLM分析
+            response = chat_function(prompt)
+            
+            if response:
+                logger.info(f"回答分析结果: {response}")
+                
+                # 尝试从回答中提取状态数字
+                if "1:" in response or "1 -" in response or "1：" in response or "状态1" in response:
+                    return 1, "用户没有回答问题"
+                elif "2:" in response or "2 -" in response or "2：" in response or "状态2" in response:
+                    return 2, "用户正在思考，回答未结束"
+                elif "3:" in response or "3 -" in response or "3：" in response or "状态3" in response:
+                    return 3, "用户已完成回答"
+                else:
+                    # 如果无法确定状态，默认为回答未结束
+                    return 2, "无法确定状态，默认为回答未结束"
+            else:
+                logger.error("分析用户回答状态失败，LLM返回为空")
+                return 2, "分析失败，默认为回答未结束"
+                
+        except Exception as e:
+            logger.error(f"分析用户回答状态错误: {e}")
+            return 2, f"分析错误: {str(e)}"
+
+    
+
+
+    # 添加一个新方法用于生成单个问题的TTS音频
+    async def generate_tts(self, text, output_path):
+        """生成单个问题的TTS音频"""
+        try:
+            logger.info(f"开始生成TTS音频: {output_path}")
+            start_time = time.time()
+            
+            # 准备请求数据
+            data = {
+                "voice": "elon_musk",  # 使用预设的声音
+                "output_file": output_path,
+                "ref_audio": self.ref_audio,
+                "ref_text": self.ref_text,
+                "gen_text": text
+            }
+            
+            # 发送请求到TTS服务
+            response = requests.post(self.tts_api_url, json=data)
+            
+            if response.status_code == 200:
+                end_time = time.time()
+                duration = end_time - start_time
+                logger.info(f"TTS音频生成成功 (用时: {duration:.2f}秒): {output_path}")
+                return True
+            else:
+                logger.error(f"TTS生成错误 (HTTP {response.status_code}): {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"TTS生成错误: {e}")
+            return False            
