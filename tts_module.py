@@ -65,14 +65,24 @@ class TTSProcessor:
         logger.info(f"{task_info}开始生成TTS音频: {filename}")
         
         try:
+            # 确保输出目录存在
+            audio_file_path = os.path.join(self.tts_audio_dir, filename)
+            output_dir = os.path.dirname(audio_file_path)
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)          
+
+            # 准备请求数据
+            data = {
+                "ref_audio": self.ref_audio,
+                "ref_text": self.ref_text,
+                "gen_text": text,
+                "nfe_step": self.nfe_step,
+                "output_file": audio_file_path  # 传递完整的输出路径
+            }                  
+
             response = requests.post(
                 self.tts_api_url,
-                json={
-                    "ref_audio": self.ref_audio,
-                    "ref_text": self.ref_text,
-                    "gen_text": text,
-                    "nfe_step": self.nfe_step,
-                }
+                json=data
             )
             response.raise_for_status()
             audio_content = response.content
@@ -81,15 +91,22 @@ class TTSProcessor:
             with open(audio_file_path, "wb") as f:
                 f.write(audio_content)
             
-            end_time = time.time()
-            duration = end_time - start_time
-            logger.info(f"{task_info}TTS音频生成完成: {audio_file_path} (用时: {duration:.2f}秒)")
-            
-            # 如果提供了队列，将生成的音频文件路径和问题文本放入队列
-            if tts_queue:
-                await tts_queue.put((audio_file_path, text))
-                
-            return audio_file_path
+            # 验证文件是否成功创建
+            if os.path.exists(audio_file_path):
+                file_size = os.path.getsize(audio_file_path)
+                if file_size > 0:
+                    end_time = time.time()
+                    duration = end_time - start_time
+                    logger.info(f"{task_info}TTS音频生成成功: {audio_file_path} (用时: {duration:.2f}秒), 文件大小: {file_size/1024:.2f}KB")
+                    
+                    # 如果提供了队列，将生成的音频文件路径和问题文本放入队列
+                    if tts_queue:
+                        await tts_queue.put((audio_file_path, text))
+                        
+                    return audio_file_path
+                else:
+                    logger.error(f"{task_info}TTS音频文件生成成功但大小为0: {audio_file_path}")
+                    return None
         except Exception as e:
             end_time = time.time()
             duration = end_time - start_time
@@ -103,8 +120,34 @@ class TTSProcessor:
     async def send_audio(self, websocket, audio_file_path):
         """发送TTS音频到客户端"""
         try:
+            # 检查文件是否存在
+            if not os.path.exists(audio_file_path):
+                logger.error(f"发送音频文件错误: [Errno 2] No such file or directory: '{audio_file_path}'")
+                
+                # 尝试在tts_audio目录中查找文件
+                filename = os.path.basename(audio_file_path)
+                alternative_path = os.path.join(self.tts_audio_dir, filename)
+                
+                if os.path.exists(alternative_path):
+                    logger.info(f"找到替代文件路径: {alternative_path}")
+                    audio_file_path = alternative_path
+                else:
+                    logger.error(f"替代文件也不存在: {alternative_path}")
+                    await websocket.send(f"Error: Could not send audio file {audio_file_path}")
+                    return False
+
+            # 检查文件大小
+            file_size = os.path.getsize(audio_file_path)
+            if file_size == 0:
+                logger.error(f"音频文件大小为0: {audio_file_path}")
+                await websocket.send(f"Error: Audio file is empty {audio_file_path}")
+                return False
+                
+            logger.info(f"准备发送音频文件: {audio_file_path}, 大小: {file_size/1024:.2f}KB")            
+
             with open(audio_file_path, "rb") as f:
                 audio_content = f.read()
+
             await websocket.send(audio_content)
             logger.info(f"发送音频文件: {audio_file_path}")
             return True
@@ -296,17 +339,32 @@ class TTSProcessor:
                 "output_file": output_path,
                 "ref_audio": self.ref_audio,
                 "ref_text": self.ref_text,
-                "gen_text": text
+                "gen_text": text,
+                "nfe_step": self.nfe_step
             }
             
             # 发送请求到TTS服务
             response = requests.post(self.tts_api_url, json=data)
             
             if response.status_code == 200:
-                end_time = time.time()
-                duration = end_time - start_time
-                logger.info(f"TTS音频生成成功 (用时: {duration:.2f}秒): {output_path}")
-                return True
+                # 将响应内容保存到文件
+                with open(output_path, "wb") as f:
+                    f.write(response.content)
+                
+                # 验证文件是否成功创建
+                if os.path.exists(output_path):
+                    file_size = os.path.getsize(output_path)
+                    if file_size > 0:
+                        end_time = time.time()
+                        duration = end_time - start_time
+                        logger.info(f"TTS音频生成成功 (用时: {duration:.2f}秒): {output_path}, 文件大小: {file_size/1024:.2f}KB")
+                        return True
+                    else:
+                        logger.error(f"TTS音频文件生成成功但大小为0: {output_path}")
+                        return False
+                else:
+                    logger.error(f"TTS音频文件未成功创建: {output_path}")
+                    return False
             else:
                 logger.error(f"TTS生成错误 (HTTP {response.status_code}): {response.text}")
                 return False
