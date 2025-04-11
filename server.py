@@ -9,6 +9,14 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler 
 from asr_module import ASRProcessor  # 导入ASR处理器
 from tts_module import TTSProcessor  # 导入TTS处理器
+from interview_report import InterviewReportGenerator  # 导入面试报告生成器
+
+# 在文件顶部添加新的导入
+import json
+from datetime import datetime
+
+# 在配置参数部分添加新的常量
+INTERVIEW_RECORDS_DIR = "interview_records"  # 面试记录保存目录
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -77,8 +85,17 @@ logger.info("ASR处理器初始化完成")
 tts_processor = TTSProcessor(tts_api_url=TTS_API_URL, tts_audio_dir=TTS_AUDIO_DIR)
 logger.info("TTS处理器初始化完成")
 
+# 初始化面试报告生成器
+report_generator = InterviewReportGenerator(INTERVIEW_RECORDS_DIR)
+logger.info("面试报告生成器初始化完成")
+
 # 在文件顶部添加一个新的常量
 SILENCE_ANALYSIS_THRESHOLD = 5  # 静音5秒后分析用户回答状态
+
+# 添加在文件中的适当位置，例如在 check_questions_ready 函数之前
+
+# 确保面试记录目录存在
+os.makedirs(INTERVIEW_RECORDS_DIR, exist_ok=True)
 
 # 检查问题生成状态
 async def check_questions_ready(tts_queue):
@@ -225,6 +242,12 @@ async def process_audio(websocket, path):
     tts_queue = asyncio.Queue()
     tts_tasks = []
 
+    # 添加面试记录相关变量
+    interview_data = {
+        "interview_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "qa_pairs": []
+    }    
+
     audio_buffer = np.array([], dtype=np.float32)
     question_counter = 1
     is_playing_audio = False
@@ -257,6 +280,14 @@ async def process_audio(websocket, path):
             logger.error(f"Predefined audio file not found: {BYE_FILE}")
             await websocket.send("Error: Predefined bye audio file not found.")
             return
+
+        # 记录第一个问题到面试记录
+        interview_data["qa_pairs"].append({
+            "question_id": 1,
+            "question": current_question,
+            "answer": "",
+            "answer_complete": False
+        })            
 
         # Send the first question audio
         await tts_processor.send_audio(websocket, QUESTION_1_FILE)
@@ -306,6 +337,12 @@ async def process_audio(websocket, path):
                                     
                                     # 将用户回答添加到对话历史
                                     conversation_history.append({"role": "user", "content": transcription})
+
+                                    # 更新面试记录中的回答
+                                    current_qa_index = current_question_id - 1
+                                    if 0 <= current_qa_index < len(interview_data["qa_pairs"]):
+                                        interview_data["qa_pairs"][current_qa_index]["answer"] = transcription
+                                        interview_data["qa_pairs"][current_qa_index]["answer_complete"] = True
                             
                             # 重置连续静音计数和更多细节标志
                             consecutive_silence_count = 0
@@ -325,6 +362,14 @@ async def process_audio(websocket, path):
                                     conversation_history.append({"role": "assistant", "content": next_question})
                                     current_question = next_question
                                     current_question_id = question_counter  # 更新当前问题ID
+
+                                    # 添加到面试记录
+                                    interview_data["qa_pairs"].append({
+                                        "question_id": question_counter,
+                                        "question": next_question,
+                                        "answer": "",
+                                        "answer_complete": False
+                                    })                                    
                                     
                                     # 生成TTS音频
                                     next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
@@ -348,6 +393,25 @@ async def process_audio(websocket, path):
                             else:
                                 logger.info("已达到最大问题数量，结束面试")
                                 await websocket.send("All questions have been asked. Thank you for the interview!")
+
+                                # 生成面试报告
+                                logger.info("开始生成面试报告...")
+                                await websocket.send("STATUS: 正在生成面试报告，请稍候...")
+                                
+                                report_file, report_content = await report_generator.generate_report(
+                                    interview_data, 
+                                    chat_with_ollama,
+                                    CONTEXT
+                                )
+                                
+                                if report_file:
+                                    logger.info(f"面试报告已生成: {report_file}")
+                                    await websocket.send(f"REPORT: {report_content}")
+                                    await websocket.send(f"STATUS: 面试报告已生成")
+                                else:
+                                    logger.error("生成面试报告失败")
+                                    await websocket.send("STATUS: 生成面试报告失败")
+
                                 # 播放结束音频
                                 await tts_processor.send_audio(websocket, BYE_FILE)
                                 break
@@ -398,6 +462,12 @@ async def process_audio(websocket, path):
                                 # 将用户回答添加到对话历史
                                 conversation_history.append({"role": "user", "content": transcription})
                                 
+                                # 更新面试记录中的回答
+                                current_qa_index = current_question_id - 1
+                                if 0 <= current_qa_index < len(interview_data["qa_pairs"]):
+                                    interview_data["qa_pairs"][current_qa_index]["answer"] = transcription
+                                    interview_data["qa_pairs"][current_qa_index]["answer_complete"] = True                                
+
                                 # 重置连续静音计数和更多细节标志
                                 consecutive_silence_count = 0
                                 more_details_sent = False
@@ -439,6 +509,25 @@ async def process_audio(websocket, path):
                                 else:
                                     logger.info("已达到最大问题数量，结束面试")
                                     await websocket.send("All questions have been asked. Thank you for the interview!")
+
+                                    # 生成面试报告
+                                    logger.info("开始生成面试报告...")
+                                    await websocket.send("STATUS: 正在生成面试报告，请稍候...")
+                                    
+                                    report_file, report_content = await report_generator.generate_report(
+                                        interview_data, 
+                                        chat_with_ollama,
+                                        CONTEXT
+                                    )
+                                    
+                                    if report_file:
+                                        logger.info(f"面试报告已生成: {report_file}")
+                                        await websocket.send(f"REPORT: {report_content}")
+                                        await websocket.send(f"STATUS: 面试报告已生成")
+                                    else:
+                                        logger.error("生成面试报告失败")
+                                        await websocket.send("STATUS: 生成面试报告失败")
+
                                     # 播放结束音频
                                     await tts_processor.send_audio(websocket, BYE_FILE)
                                     break
