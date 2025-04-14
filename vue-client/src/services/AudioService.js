@@ -35,7 +35,10 @@ class AudioService {
   async initAudio() {
     try {
       // 创建音频上下文，不指定采样率，使用浏览器默认值
-      this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+        latencyHint: 'interactive', // 降低延迟
+        sampleRate: 48000 // 尝试使用固定的采样率
+      });
 
       // 记录实际采样率
       this.actualSampleRate = this.audioContext.sampleRate;
@@ -45,11 +48,45 @@ class AudioService {
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true
+          autoGainControl: true,
+          // 添加更多音频约束
+          channelCount: 1, // 强制单声道
+          sampleRate: { ideal: 48000 }, // 理想的采样率
+          latency: { ideal: 0.01 }, // 低延迟
+          // 添加更多约束以提高音质
+          sampleSize: { ideal: 16 }, // 16位采样
+          volume: { ideal: 1.0 } // 最大音量
         }
       });
 
       this.audioStream = stream;
+
+      // 获取音频轨道并应用更多设置
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length > 0) {
+        const track = audioTracks[0];
+        const capabilities = track.getCapabilities();
+        console.log('音频轨道能力:', capabilities);
+
+        // 尝试应用最佳设置
+        try {
+          const settings = {
+            autoGainControl: true,
+            echoCancellation: true,
+            noiseSuppression: true
+          };
+
+          if (capabilities.sampleRate && capabilities.sampleRate.max >= 48000) {
+            settings.sampleRate = 48000;
+          }
+
+          track.applyConstraints(settings);
+          console.log('已应用音频轨道设置:', settings);
+        } catch (constraintError) {
+          console.warn('应用音频约束失败:', constraintError);
+        }
+      }
+
       return true;
     } catch (error) {
       console.error('初始化音频失败:', error);
@@ -84,6 +121,12 @@ class AudioService {
       let offsetResult = 0;
       let offsetAudio = 0;
 
+      // 添加抗混叠滤波器
+      // 简单的低通滤波器，截止频率为目标采样率的一半
+      const filterCoeff = Math.min(0.9, toSampleRate / fromSampleRate);
+      let prevSample = 0;
+      let prevPrevSample = 0; // 添加第二个历史样本，实现更好的滤波效果     
+
       while (offsetResult < result.length) {
         const endOffset = Math.min(offsetResult + CHUNK_SIZE, result.length);
 
@@ -96,8 +139,34 @@ class AudioService {
           if (indexAudio >= audioData.length - 1) {
             result[i] = audioData[audioData.length - 1];
           } else {
-            // 线性插值
-            result[i] = audioData[indexAudio] * (1 - alpha) + audioData[indexAudio + 1] * alpha;
+            // 使用三次样条插值而不是线性插值，提供更平滑的结果
+            let sample;
+
+            if (indexAudio > 0 && indexAudio < audioData.length - 2) {
+              // 三次样条插值
+              const y0 = audioData[indexAudio - 1];
+              const y1 = audioData[indexAudio];
+              const y2 = audioData[indexAudio + 1];
+              const y3 = audioData[indexAudio + 2];
+
+              const a0 = y3 - y2 - y0 + y1;
+              const a1 = y0 - y1 - a0;
+              const a2 = y2 - y0;
+              const a3 = y1;
+
+              sample = a0 * alpha * alpha * alpha + a1 * alpha * alpha + a2 * alpha + a3;
+            } else {
+              // 回退到线性插值
+              sample = audioData[indexAudio] * (1 - alpha) + audioData[indexAudio + 1] * alpha;
+            }
+
+            // 应用改进的低通滤波
+            // 二阶IIR滤波器，提供更平滑的频率响应
+            const filteredSample = 0.2 * sample + 0.5 * prevSample + 0.3 * prevPrevSample;
+            prevPrevSample = prevSample;
+            prevSample = filteredSample;
+
+            result[i] = filteredSample;
           }
 
           // 更新音频偏移量
@@ -106,6 +175,21 @@ class AudioService {
 
         // 更新结果偏移量
         offsetResult = endOffset;
+      }
+
+      // 归一化音频数据，确保音量一致
+      let maxAbs = 0;
+      for (let i = 0; i < result.length; i++) {
+        maxAbs = Math.max(maxAbs, Math.abs(result[i]));
+      }
+
+      // 只有当最大值过小或过大时才进行归一化
+      if ((maxAbs > 0.01 && maxAbs < 0.5) || maxAbs > 0.95) {
+        const normFactor = 0.7 / maxAbs; // 保留更多余量，避免削波
+        for (let i = 0; i < result.length; i++) {
+          result[i] *= normFactor;
+        }
+        console.log(`已归一化音频数据，系数: ${normFactor.toFixed(4)}`);
       }
 
       console.log(`重采样完成: 新样本数: ${result.length}`);
@@ -375,10 +459,10 @@ class AudioService {
     }
 
     console.log('开始音频处理...');
-    
+
     // 使用较长的间隔时间，减少处理频率
     const PROCESSING_INTERVAL = 1000; // 1秒处理一次
-    
+
     this.processingInterval = setInterval(() => {
       try {
         if (!this.isRecording || this.paused) {
@@ -393,7 +477,7 @@ class AudioService {
 
         // 计算队列中的总样本数
         const totalSamples = this.audioQueue.reduce((acc, curr) => acc + curr.length, 0);
-        
+
         // 如果累积的样本数太少，等待更多数据
         const minSamples = this.targetSampleRate * 1; // 至少1秒的音频
         if (totalSamples < minSamples) {
@@ -406,7 +490,7 @@ class AudioService {
         // 合并音频数据
         const mergedData = new Float32Array(totalSamples);
         let offset = 0;
-        
+
         // 使用循环而不是forEach，避免回调函数开销
         for (let i = 0; i < this.audioQueue.length; i++) {
           const audioData = this.audioQueue[i];
@@ -419,7 +503,7 @@ class AudioService {
 
         // 重要：添加重采样步骤
         const resampledData = this.resampleAudio(mergedData, this.actualSampleRate, this.targetSampleRate);
-        console.log(`重采样结果: 从 ${mergedData.length} 样本 (${this.actualSampleRate}Hz) 到 ${resampledData.length} 样本 (${this.targetSampleRate}Hz)`);        
+        console.log(`重采样结果: 从 ${mergedData.length} 样本 (${this.actualSampleRate}Hz) 到 ${resampledData.length} 样本 (${this.targetSampleRate}Hz)`);
 
         // 使用setTimeout将回调放入事件队列，避免同步调用栈过深
         setTimeout(() => {
@@ -616,7 +700,7 @@ class AudioService {
     }
 
     // 如果已经尝试过但失败了，不再重复尝试
-    if (this.fileSystemAccessAttempted && !this.fileSystemInitialized  && !fromUserGesture) {
+    if (this.fileSystemAccessAttempted && !this.fileSystemInitialized && !fromUserGesture) {
       console.warn('之前已尝试初始化文件系统但失败，不再重试');
       return false;
     }
@@ -686,120 +770,66 @@ class AudioService {
     }
   }
 
-  // 修改 float32ToWav 方法，添加调用栈跟踪
-  float32ToWav(float32Array) {
+  // 将Float32Array转换为WAV格式的Blob
+  float32ToWav(samples) {
     try {
-      console.log(`转换Float32Array到WAV: ${float32Array.length} 样本, 采样率: ${this.targetSampleRate}Hz`);
+      console.log(`转换Float32Array到WAV: ${samples.length} 样本, 采样率: ${this.targetSampleRate}Hz`);
 
-      // 检查数据有效性
-      if (!float32Array || float32Array.length === 0) {
-        console.error('无效的音频数据: 空或长度为0');
-        return null;
+      // 确保采样率正确
+      const sampleRate = this.targetSampleRate;
+
+      // 确保音频数据在[-1,1]范围内
+      const maxSample = Math.max(...Array.from(samples).map(Math.abs));
+      if (maxSample > 1.0) {
+        console.warn(`音频样本超出范围，最大值: ${maxSample}，进行归一化`);
+        samples = samples.map(s => s / maxSample);
       }
 
-      // 检查是否有NaN或Infinity值
-      let hasInvalidValues = false;
-      let minValue = Infinity;
-      let maxValue = -Infinity;
-      let sumValue = 0;
-
-      for (let i = 0; i < float32Array.length; i++) {
-        if (isNaN(float32Array[i]) || !isFinite(float32Array[i])) {
-          hasInvalidValues = true;
-          float32Array[i] = 0; // 将无效值替换为0
-        } else {
-          minValue = Math.min(minValue, float32Array[i]);
-          maxValue = Math.max(maxValue, float32Array[i]);
-          sumValue += Math.abs(float32Array[i]);
-        }
-      }
-
-      const avgValue = sumValue / float32Array.length;      
-
-      if (hasInvalidValues) {
-        console.warn('检测到无效的音频样本值，已替换为0');
-      }
-
-      console.log(`音频数据统计: 最小值=${minValue.toFixed(6)}, 最大值=${maxValue.toFixed(6)}, 平均绝对值=${avgValue.toFixed(6)}`);
-
-      // 如果音频数据过于安静，可能是录音问题
-      if (avgValue < 0.001) {
-        console.warn('音频数据非常安静，可能没有正确录制声音');
-      }      
-
-      // 创建WAV文件头
-      const numChannels = 1; // 单声道
-      const bitsPerSample = 16; // 16位PCM
-      const bytesPerSample = bitsPerSample / 8;
-      const blockAlign = numChannels * bytesPerSample;
-      const byteRate = this.targetSampleRate * blockAlign;
-      const dataSize = float32Array.length * bytesPerSample;
-      const bufferSize = 44 + dataSize;
-
-      // 安全检查
-      if (bufferSize <= 44 || bufferSize > 100000000) {
-        console.error(`无效的缓冲区大小: ${bufferSize}`);
-        return null;
-      }
-
-      const buffer = new ArrayBuffer(bufferSize);
+      // 转换为16位PCM
+      const buffer = new ArrayBuffer(44 + samples.length * 2);
       const view = new DataView(buffer);
 
       // 写入WAV头
-      // "RIFF"
-      view.setUint8(0, 0x52);
-      view.setUint8(1, 0x49);
-      view.setUint8(2, 0x46);
-      view.setUint8(3, 0x46);
-      // 文件大小
-      view.setUint32(4, 36 + dataSize, true);
-      // "WAVE"
-      view.setUint8(8, 0x57);
-      view.setUint8(9, 0x41);
-      view.setUint8(10, 0x56);
-      view.setUint8(11, 0x45);
-      // "fmt "
-      view.setUint8(12, 0x66);
-      view.setUint8(13, 0x6D);
-      view.setUint8(14, 0x74);
-      view.setUint8(15, 0x20);
-      // 格式块大小
+      // "RIFF"标识
+      this._writeString(view, 0, 'RIFF');
+      // 文件长度
+      view.setUint32(4, 36 + samples.length * 2, true);
+      // "WAVE"标识
+      this._writeString(view, 8, 'WAVE');
+      // "fmt "子块
+      this._writeString(view, 12, 'fmt ');
+      // 子块长度
       view.setUint32(16, 16, true);
       // 音频格式 (1 = PCM)
       view.setUint16(20, 1, true);
-      // 声道数
-      view.setUint16(22, numChannels, true);
+      // 声道数 (1 = 单声道)
+      view.setUint16(22, 1, true);
       // 采样率
-      view.setUint32(24, this.targetSampleRate, true);
-      // 字节率
-      view.setUint32(28, byteRate, true);
-      // 块对齐
-      view.setUint16(32, blockAlign, true);
+      view.setUint32(24, sampleRate, true);
+      // 字节率 (采样率 * 每个样本的字节数)
+      view.setUint32(28, sampleRate * 2, true);
+      // 块对齐 (声道数 * 每个样本的字节数)
+      view.setUint16(32, 2, true);
       // 每个样本的位数
-      view.setUint16(34, bitsPerSample, true);
-      // "data"
-      view.setUint8(36, 0x64);
-      view.setUint8(37, 0x61);
-      view.setUint8(38, 0x74);
-      view.setUint8(39, 0x61);
-      // 数据大小
-      view.setUint32(40, dataSize, true);
+      view.setUint16(34, 16, true);
+      // "data"子块
+      this._writeString(view, 36, 'data');
+      // 数据长度
+      view.setUint32(40, samples.length * 2, true);
 
-      // 写入音频数据
-      let offsetData = 44;
-      for (let i = 0; i < float32Array.length; i++) {
-        // 将float32转换为int16
-        const sample = Math.max(-1, Math.min(1, float32Array[i]));
-        const value = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-        view.setInt16(offsetData, value, true);
-        offsetData += 2;
+      // 写入PCM数据
+      let offset = 44;
+      for (let i = 0; i < samples.length; i++, offset += 2) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
       }
 
-      // 创建Blob
-      const wavBlob = new Blob([buffer], { type: 'audio/wav' });
-      console.log(`WAV转换完成: ${wavBlob.size} 字节`);
-
-      return wavBlob;
+            
+      // 创建Blob对象
+      const blob = new Blob([buffer], { type: 'audio/wav' });
+      console.log(`音频转换完成: WAV大小 ${blob.size} 字节`);
+      
+      return blob;
 
     } catch (error) {
       console.error(`Float32Array转WAV失败: ${error.message}`, error);
@@ -808,11 +838,25 @@ class AudioService {
     }
   }
 
-  // 辅助函数：将字符串写入DataView
+    
+  // 辅助方法：写入字符串到DataView
   _writeString(view, offset, string) {
     for (let i = 0; i < string.length; i++) {
       view.setUint8(offset + i, string.charCodeAt(i));
     }
+  }
+
+  // 添加动态范围压缩函数，减少尖锐声音
+  _compressDynamicRange(sample, threshold) {
+    // 简单的动态范围压缩，减少高音量样本的尖锐感
+    if (Math.abs(sample) > threshold) {
+      // 对超过阈值的部分应用非线性压缩
+      const sign = sample > 0 ? 1 : -1;
+      const overThreshold = Math.abs(sample) - threshold;
+      const compressed = threshold + Math.tanh(overThreshold) * (1 - threshold);
+      return sign * compressed;
+    }
+    return sample;
   }
 
   // 优化 logAudioStats 方法，避免栈溢出
@@ -827,33 +871,33 @@ class AudioService {
       // 限制处理的样本数量，避免过度消耗栈空间
       const MAX_SAMPLES_TO_ANALYZE = 10000;
       const samplesToAnalyze = Math.min(audioData.length, MAX_SAMPLES_TO_ANALYZE);
-      
+
       // 使用循环而不是数组方法来计算统计数据
       let min = Infinity;
       let max = -Infinity;
       let sum = 0;
       let sumSquares = 0;
-      
+
       for (let i = 0; i < samplesToAnalyze; i++) {
         const value = audioData[i];
-        
+
         // 跳过无效值
         if (isNaN(value) || !isFinite(value)) continue;
-        
+
         min = Math.min(min, value);
         max = Math.max(max, value);
         sum += value;
         sumSquares += value * value;
       }
-      
+
       // 计算统计值
       const mean = sum / samplesToAnalyze;
       const variance = (sumSquares / samplesToAnalyze) - (mean * mean);
       const rms = Math.sqrt(sumSquares / samplesToAnalyze);
-      
+
       // 检测是否为静音
       const isSilent = rms < this.silenceThreshold;
-      
+
       // 记录统计信息
       console.log(`音频统计 (${samplesToAnalyze}/${audioData.length} 样本): 
         最小值: ${min.toFixed(6)}, 
@@ -861,7 +905,7 @@ class AudioService {
         平均值: ${mean.toFixed(6)}, 
         RMS: ${rms.toFixed(6)}, 
         是否静音: ${isSilent}`);
-      
+
       return {
         min,
         max,
