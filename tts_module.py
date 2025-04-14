@@ -285,7 +285,9 @@ class TTSProcessor:
         1 - 用户没有回答问题
         2 - 用户正在思考，回答未结束
         3 - 用户已完成回答
+        4 - 用户不想回答当前问题
         """
+
         try:
             # 构建分析提示
             prompt = [
@@ -295,7 +297,7 @@ class TTSProcessor:
                 },
                 {
                     "role": "user",
-                    "content": f"问题: {current_question}\n\n用户回答: {transcription}\n\n请分析用户回答状态，并返回以下三种状态之一:\n1 - 用户没有回答问题\n2 - 用户正在思考，回答未结束\n3 - 用户已完成回答\n\n只需返回数字和简短解释，格式为: '状态数字:解释'"
+                    "content": f"问题: {current_question}\n\n用户回答: {transcription}\n\n请分析用户回答状态，并返回以下三种状态之一:\n1 - 用户没有回答问题\n2 - 用户正在思考，回答未结束\n3 - 用户已完成回答\n 4 - 用户拒绝回答当前问题 \n\n只需返回数字和简短解释，格式为: '状态数字:解释'"
                 }
             ]
             
@@ -312,6 +314,8 @@ class TTSProcessor:
                     return 2, "用户正在思考，回答未结束"
                 elif "3:" in response or "3 -" in response or "3：" in response or "状态3" in response:
                     return 3, "用户已完成回答"
+                elif "4:" in response or "4 -" in response or "4：" in response or "状态4" in response:
+                    return 3, "用户拒绝回答该问题"                    
                 else:
                     # 如果无法确定状态，默认为回答未结束
                     return 2, "无法确定状态，默认为回答未结束"
@@ -322,8 +326,6 @@ class TTSProcessor:
         except Exception as e:
             logger.error(f"分析用户回答状态错误: {e}")
             return 2, f"分析错误: {str(e)}"
-
-    
 
 
     # 添加一个新方法用于生成单个问题的TTS音频

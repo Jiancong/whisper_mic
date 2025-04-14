@@ -34,7 +34,7 @@ TTS_AUDIO_DIR = "tts_audio"  # Generated TTS audio directory
 INTERVIEWER_NAME = "elon_musk"  # Interviewer subdirectory name
 MIN_RESPONSE_LENGTH = 20  # Minimum response length (characters)
 TIMEOUT_SECONDS = 60  # 增加超时时间从20秒到60秒
-MAX_QUESTIONS = 2  # Maximum number of questions
+MAX_QUESTIONS = 3  # Maximum number of questions
 TRANSCRIPTION_INTERVAL = 3  # 增加转录间隔时间，从2秒到5秒
 MIN_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 3  # 至少需要5秒的音频才开始转录，而不是0.1秒
 MAX_AUDIO_BUFFER_SIZE = SAMPLE_RATE * 120  # 最多保留120秒的音频数据，从60秒增加到120秒
@@ -232,6 +232,94 @@ async def transcribe_periodically(websocket, audio_buffer, last_transcription_ti
         except Exception as e:
             logger.error(f"实时转录错误: {e}")
     return last_transcription_time
+
+async def handle_user_refuse_current_question(
+    websocket, 
+    transcription, 
+    conversation_history, 
+    interview_data, 
+    current_question_id, 
+    question_counter, 
+    chat_with_ollama, 
+    tts_processor, 
+    audio_buffer, 
+    current_question
+):
+    """处理用户拒绝当前问题的情况"""
+    logger.info("用户不想回答当前问题，跳过并生成下一个问题")
+    await websocket.send("STATUS: 正在生成下一个问题...")
+    
+    # 将用户拒绝回答的信息添加到对话历史
+    conversation_history.append({"role": "user", "content": transcription})
+    
+    # 更新面试记录中的回答
+    current_qa_index = current_question_id - 1
+    if 0 <= current_qa_index < len(interview_data["qa_pairs"]):
+        interview_data["qa_pairs"][current_qa_index]["answer"] = transcription
+        interview_data["qa_pairs"][current_qa_index]["answer_complete"] = True
+        interview_data["qa_pairs"][current_qa_index]["user_skipped"] = True
+    
+    # 重置状态标志
+    consecutive_silence_count = 0
+    more_details_sent = False
+    
+    # 生成下一个问题
+    if question_counter <= MAX_QUESTIONS:
+        logger.info("生成下一个问题...")
+        
+        # 生成下一个问题
+        next_question = chat_with_ollama(conversation_history)
+        
+        if next_question:
+            logger.info(f"生成的下一个问题: {next_question}")
+            
+            # 添加到对话历史
+            conversation_history.append({"role": "assistant", "content": next_question})
+            new_current_question = next_question
+            new_current_question_id = question_counter  # 更新当前问题ID
+            
+            # 添加到面试记录
+            interview_data["qa_pairs"].append({
+                "question_id": question_counter,
+                "question": next_question,
+                "answer": "",
+                "answer_complete": False,
+                "user_skipped": False
+            })
+            
+            # 生成TTS音频
+            next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
+            success = await tts_processor.generate_tts(next_question, next_audio_path)
+            
+            if success:
+                logger.info(f"已生成问题音频: {next_audio_path}")
+                await tts_processor.send_audio(websocket, next_audio_path)
+                logger.info(f"已发送下一个问题: {next_question}")
+                
+                awaiting_response = True
+                new_question_counter = question_counter + 1
+                # 清空音频缓冲区，准备接收下一个回答
+                new_audio_buffer = np.array([], dtype=np.float32)
+                
+                return (True, new_audio_buffer, new_current_question, new_current_question_id, 
+                        new_question_counter, awaiting_response, consecutive_silence_count, more_details_sent)
+            else:
+                logger.error("TTS生成失败，使用预定义的更多细节音频")
+                await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+        else:
+            logger.error("问题生成失败，使用预定义的更多细节音频")
+            await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+    else:
+        logger.info("已达到最大问题数量，结束面试")
+        await websocket.send("All questions have been asked. Thank you for the interview!")
+        # 播放结束音频
+        await tts_processor.send_audio(websocket, BYE_FILE)
+        return (False, audio_buffer, current_question, current_question_id, 
+                question_counter, False, consecutive_silence_count, more_details_sent)
+    
+    # 如果没有成功生成下一个问题，返回原始状态
+    return (True, audio_buffer, current_question, current_question_id, 
+            question_counter, True, consecutive_silence_count, more_details_sent)    
 
 # Main audio processing function
 async def process_audio(websocket, path):
@@ -535,6 +623,18 @@ async def process_audio(websocket, path):
                                 # 重置超时计时器
                                 start_time = time.time()
                                 silence_counter = 0
+                            elif response_status == 4:  # 用户回答无效
+                                # 调用处理用户跳过问题的函数
+                                continue_interview, audio_buffer, current_question, current_question_id, \
+                                question_counter, awaiting_response, consecutive_silence_count, more_details_sent = \
+                                    await handle_user_refuse_current_question(
+                                        websocket, transcription, conversation_history, interview_data,
+                                        current_question_id, question_counter, chat_with_ollama,
+                                        tts_processor, audio_buffer, current_question
+                                    )
+                                
+                                if not continue_interview:
+                                    break
                         else:
                             logger.info("最终转录结果为空，继续等待用户输入")
                     
@@ -667,7 +767,18 @@ async def process_audio(websocket, path):
                                         # 播放结束音频
                                         await tts_processor.send_audio(websocket, BYE_FILE)
                                         break
-
+                                elif response_status == 4:  # 用户回答无效
+                                    # 调用处理用户跳过问题的函数
+                                    continue_interview, audio_buffer, current_question, current_question_id, \
+                                    question_counter, awaiting_response, consecutive_silence_count, more_details_sent = \
+                                        await handle_user_refuse_current_question(
+                                            websocket, transcription, conversation_history, interview_data,
+                                            current_question_id, question_counter, chat_with_ollama,
+                                            tts_processor, audio_buffer, current_question
+                                        )
+                                    
+                                    if not continue_interview:
+                                        break
                         # 重置超时计时器，只要收到音频数据就刷新
                         start_time = time.time()
                         silence_counter = 0  # 重置静音计数器
@@ -809,7 +920,19 @@ async def process_audio(websocket, path):
                                     # 播放结束音频
                                     await tts_processor.send_audio(websocket, BYE_FILE)
                                     break
-                    
+
+                            elif response_status == 4:  # 用户回答无效
+                                # 调用处理用户跳过问题的函数
+                                continue_interview, audio_buffer, current_question, current_question_id, \
+                                question_counter, awaiting_response, consecutive_silence_count, more_details_sent = \
+                                    await handle_user_refuse_current_question(
+                                        websocket, transcription, conversation_history, interview_data,
+                                        current_question_id, question_counter, chat_with_ollama,
+                                        tts_processor, audio_buffer, current_question
+                                    )
+                                
+                                if not continue_interview:
+                                    break                    
                     denoised_chunk = audio_chunk
 
                     # 限制音频缓冲区大小，防止内存溢出
