@@ -611,22 +611,33 @@ class AudioService {
 
 
   // 修改 saveDebugWavFile 方法，确保文件保存到正确的目录
-  async saveDebugWavFile(wavBlob, prefix = 'debug') {
+  async saveDebugWavFile(audioBlob, prefix = 'debug') {
     try {
       // 检查文件系统是否已初始化
       if (!this.fileSystemInitialized || !this.debugDirHandle) {
         console.warn('调试文件系统未初始化，尝试重新初始化...');
-        const result = await this.autoInitFileSystemAccess(false);
-        if (result && result.needsUserGesture) {
-          console.error('需要用户交互才能初始化文件系统，使用下载方式保存');
-          return this._saveDebugWavFileDownload(wavBlob, prefix);
-        }
-
-        if (!result || !this.fileSystemInitialized) {
-          console.error('无法初始化文件系统，将使用下载方式保存文件');
-          return this._saveDebugWavFileDownload(wavBlob, prefix);
-        }
+        return null;
       }
+
+      // 确保audioBlob是WAV格式
+      let wavBlob = audioBlob;
+      
+      // 如果audioBlob不是WAV格式，需要转换
+      if (audioBlob.type !== 'audio/wav') {
+        console.log('转换音频数据为WAV格式...');
+        
+        // 从Blob中读取Float32Array数据
+        const arrayBuffer = await audioBlob.arrayBuffer();
+        const floatData = new Float32Array(arrayBuffer);
+        
+        // 使用float32ToWav方法转换为WAV格式
+        wavBlob = this.float32ToWav(floatData, this.targetSampleRate);
+        
+        if (!wavBlob) {
+          console.error('转换为WAV格式失败');
+          return null;
+        }
+      }      
 
       // 生成文件名
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -660,7 +671,7 @@ class AudioService {
   }
 
   // 添加下载方式保存文件的备用方法
-  _saveDebugWavFileDownload(wavBlob, prefix = 'debug') {
+  _saveDebugWavFileDownload(audioBlob, prefix = 'debug') {
     try {
       // 生成文件名
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -669,7 +680,7 @@ class AudioService {
       console.log(`使用下载方式保存调试文件: ${fileName}`);
 
       // 创建下载链接
-      const url = URL.createObjectURL(wavBlob);
+      const url = URL.createObjectURL(audioBlob);
       const a = document.createElement('a');
       a.href = url;
       a.download = fileName;
@@ -824,11 +835,11 @@ class AudioService {
         view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
       }
 
-            
+
       // 创建Blob对象
       const blob = new Blob([buffer], { type: 'audio/wav' });
       console.log(`音频转换完成: WAV大小 ${blob.size} 字节`);
-      
+
       return blob;
 
     } catch (error) {
@@ -838,7 +849,39 @@ class AudioService {
     }
   }
 
-    
+  // 将Float32Array直接发送，不转换为WAV
+  prepareAudioForSending(samples) {
+    try {
+      console.log(`准备发送音频: ${samples.length} 样本, 采样率: ${this.targetSampleRate}Hz`);
+
+      // 确保采样率正确
+      if (this.actualSampleRate !== this.targetSampleRate) {
+        // 如果需要重采样，使用现有的重采样方法
+        samples = this.resampleAudio(samples, this.actualSampleRate, this.targetSampleRate);
+      }
+
+      // 创建一个ArrayBuffer来存储float32数据
+      const buffer = new ArrayBuffer(samples.length * 4); // 每个float32值占4字节
+      const view = new Float32Array(buffer);
+
+      // 复制数据
+      for (let i = 0; i < samples.length; i++) {
+        view[i] = samples[i];
+      }
+
+      // 创建Blob对象
+      const blob = new Blob([buffer], { type: 'application/octet-stream' });
+      console.log(`音频准备完成: 大小 ${blob.size} 字节`);
+
+      return blob;
+    } catch (error) {
+      console.error('准备音频数据失败:', error);
+      console.error('错误调用栈:', error.stack);
+      return null;
+    }
+  }
+
+
   // 辅助方法：写入字符串到DataView
   _writeString(view, offset, string) {
     for (let i = 0; i < string.length; i++) {
@@ -923,7 +966,7 @@ class AudioService {
 
 
   // 添加保存到IndexedDB的辅助方法
-  _saveToIndexedDB(wavBlob, fileName) {
+  _saveToIndexedDB(audioBlob, fileName) {
     // 打开或创建IndexedDB数据库
     const request = indexedDB.open('AudioDebugDB', 1);
 
@@ -942,7 +985,7 @@ class AudioService {
       // 保存Blob到IndexedDB
       store.put({
         fileName: fileName,
-        data: wavBlob,
+        data: audioBlob,
         timestamp: new Date().getTime()
       });
 
@@ -973,7 +1016,7 @@ class AudioService {
   }
 
   // 修改保存到本地文件系统的辅助方法，增强错误处理
-  async _saveToLocalFileSystem(wavBlob, fileName) {
+  async _saveToLocalFileSystem(audioBlob, fileName) {
     try {
       // 检查是否已经获取了目录句柄
       if (!this.debugDirHandle) {
@@ -1001,8 +1044,8 @@ class AudioService {
       const writable = await fileHandle.createWritable();
 
       // 写入Blob数据
-      console.log(`写入数据: ${wavBlob.size} 字节`);
-      await writable.write(wavBlob);
+      console.log(`写入数据: ${audioBlob.size} 字节`);
+      await writable.write(audioBlob);
 
       // 关闭流
       console.log('关闭文件写入流');

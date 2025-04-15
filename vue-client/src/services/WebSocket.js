@@ -61,14 +61,15 @@ class WebSocketService {
               console.log('收到WebSocket文本消息:', event.data);
 
               // 检查是否是转录结果
-              if (event.data.startsWith('TRANSCRIPTION:')) {
+              if (typeof event.data === 'string' && event.data.startsWith('TRANSCRIPTION:')) {
                 const transcription = event.data.substring('TRANSCRIPTION:'.length).trim();
+                console.log('收到转录文本:', transcription);
                 if (this.callbacks.onTranscription) {
                   this.callbacks.onTranscription(transcription);
                 }
               }
               // 检查是否是状态更新
-              else if (event.data.startsWith('STATUS:')) {
+              else if (typeof event.data === 'string' && event.data.startsWith('STATUS:')) {
                 const status = event.data.substring('STATUS:'.length).trim();
                 if (this.callbacks.onStatusChange) {
                   this.callbacks.onStatusChange(status);
@@ -153,8 +154,14 @@ class WebSocketService {
       if (data instanceof Blob) {
         console.log(`发送二进制数据: ${data.size} 字节, 类型: ${data.type}`);
         
+        // 添加前缀"AUDIO:"，与Python客户端保持一致
+        // 创建一个新的Blob，包含前缀和原始数据
+        const prefix = 'AUDIO:';
+        const prefixBlob = new Blob([prefix], { type: 'text/plain' });
+        const combinedBlob = new Blob([prefixBlob, data], { type: data.type });
+
         // 直接发送Blob数据，不尝试转换
-        this.socket.send(data);
+        this.socket.send(combinedBlob);
         return true;
       } else if (typeof data === 'string') {
         console.log(`发送文本消息: ${data.substring(0, 50)}${data.length > 50 ? '...' : ''}`);

@@ -210,12 +210,12 @@ export default {
                 console.error('统计错误调用栈:', statsError.stack);
               }
 
-              // 将Float32Array转换为WAV格式的Blob
-              let wavBlob;
+              // 将Float32Array转换为服务端可处理的格式
+              let audioBlob;
               try {
-                wavBlob = AudioService.float32ToWav(audioData);
-                if (!wavBlob) {
-                  addLog('error', '音频数据转换为WAV失败');
+                audioBlob = AudioService.prepareAudioForSending(audioData);
+                if (!audioBlob) {
+                  addLog('error', '音频数据准备失败');
                   return;
                 }
               } catch (conversionError) {
@@ -232,6 +232,8 @@ export default {
               try {
                 // 使用Promise.resolve().then()将操作放入微任务队列
                 Promise.resolve().then(() => {
+                  // 先将audioData转换为WAV格式
+                  const wavBlob = AudioService.float32ToWav(audioData, AudioService.targetSampleRate);
                   return AudioService.saveDebugWavFile(wavBlob, 'send');
                 })
                   .then(debugUrl => {
@@ -243,21 +245,21 @@ export default {
                     }
 
                     // 发送音频数据到服务器
-                    return sendAudioData(wavBlob, audioData.length, durationSec);
+                    return sendAudioData(audioBlob, audioData.length, durationSec);
                   })
                   .catch(error => {
                     addLog('error', `保存调试音频失败: ${error.message}`);
                     console.error('保存错误调用栈:', error.stack);
 
                     // 即使保存失败也尝试发送
-                    return sendAudioData(wavBlob, audioData.length, durationSec);
+                    return sendAudioData(audioBlob, audioData.length, durationSec);
                   });
               } catch (saveError) {
                 addLog('error', `保存调试音频过程中出错: ${saveError.message}`);
                 console.error('保存过程错误调用栈:', saveError.stack);
 
                 // 尝试直接发送
-                sendAudioData(wavBlob, audioData.length, durationSec);
+                sendAudioData(audioBlob, audioData.length, durationSec);
               }
             } else {
               console.log('忽略音频数据: 未录音或未连接');
@@ -282,12 +284,12 @@ export default {
     };
 
     // 提取发送音频数据的功能为单独的函数
-    const sendAudioData = (wavBlob, sampleCount, durationSec) => {
+    const sendAudioData = (audioBlob, sampleCount, durationSec) => {
       try {
-        addLog('info', `准备发送音频数据: ${sampleCount} 样本, WAV大小: ${wavBlob.size} 字节, 估计时长: ${durationSec.toFixed(2)}秒`);
-        const success = WebSocketService.send(wavBlob);
+        addLog('info', `准备发送音频数据: ${sampleCount} 样本, WAV大小: ${audioBlob.size} 字节, 估计时长: ${durationSec.toFixed(2)}秒`);
+        const success = WebSocketService.send(audioBlob);
         if (success) {
-          addLog('info', `已发送音频数据: ${wavBlob.size} 字节, 采样率: ${AudioService.targetSampleRate}Hz, 估计时长: ${durationSec.toFixed(2)}秒`);
+          addLog('info', `已发送音频数据: ${audioBlob.size} 字节, 采样率: ${AudioService.targetSampleRate}Hz, 估计时长: ${durationSec.toFixed(2)}秒`);
         } else {
           addLog('error', '发送音频数据失败');
         }
