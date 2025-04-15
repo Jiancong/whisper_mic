@@ -201,143 +201,137 @@ class AudioService {
     }
   }
 
-  // 优化停止录音方法，避免处理过大的数据导致栈溢出
   stopRecording() {
-    if (!this.isRecording) return;
+    if (!this.isRecording) {
+      return;
+    }
 
     console.log('停止录音，处理剩余音频数据...');
 
-    try {
-      // 处理队列中剩余的音频数据
-      if (this.audioQueue.length > 0) {
-        // 计算队列中所有音频数据的总长度
-        const totalLength = this.audioQueue.reduce((acc, curr) => acc + curr.length, 0);
-        console.log(`处理剩余的 ${this.audioQueue.length} 块音频数据，共 ${totalLength} 样本`);
+    // 停止录音
+    this.isRecording = false;
 
-        // 检查数据量是否过大
-        if (totalLength > 1000000) { // 如果超过100万个样本，只处理最后一部分
-          console.warn(`音频数据过大 (${totalLength} 样本)，只处理最后部分以避免栈溢出`);
+    // 停止音频处理
+    if (this.processingInterval) {
+      clearInterval(this.processingInterval);
+      this.processingInterval = null;
+    }
 
-          // 只保留最后几个块，总计不超过50万个样本
-          let accumulatedLength = 0;
-          let startIndex = this.audioQueue.length - 1;
-
-          while (startIndex >= 0 && accumulatedLength < 500000) {
-            accumulatedLength += this.audioQueue[startIndex].length;
-            startIndex--;
-          }
-
-          // 调整起始索引
-          startIndex = Math.max(0, startIndex + 1);
-
-          // 创建新的队列
-          const trimmedQueue = this.audioQueue.slice(startIndex);
-          console.log(`裁剪后的队列: ${trimmedQueue.length} 块，约 ${accumulatedLength} 样本`);
-
-          try {
-            // 合并裁剪后的音频数据
-            const mergedData = new Float32Array(accumulatedLength);
-            let offset = 0;
-            for (const audioData of trimmedQueue) {
-              mergedData.set(audioData, offset);
-              offset += audioData.length;
-            }
-
-            // 发送合并后的音频数据
-            if (this.callbacks.onAudioData) {
-              console.log(`发送最后的音频数据到回调: ${mergedData.length} 样本, 估计时长: ${(mergedData.length / this.targetSampleRate).toFixed(2)}秒`);
-
-              // 使用setTimeout避免栈溢出
-              setTimeout(() => {
-                try {
-                  this.callbacks.onAudioData(mergedData);
-                } catch (callbackError) {
-                  console.error('回调执行出错:', callbackError);
-                  console.error('错误调用栈:', callbackError.stack);
-                }
-              }, 0);
-            }
-          } catch (mergeError) {
-            console.error('合并音频数据出错:', mergeError);
-            console.error('错误调用栈:', mergeError.stack);
-          }
-        } else {
-          // 数据量合理，正常处理
-          try {
-            // 合并所有音频数据
-            const mergedData = new Float32Array(totalLength);
-            let offset = 0;
-            for (const audioData of this.audioQueue) {
-              mergedData.set(audioData, offset);
-              offset += audioData.length;
-            }
-
-            // 发送合并后的音频数据
-            if (this.callbacks.onAudioData) {
-              console.log(`发送最后的音频数据到回调: ${mergedData.length} 样本, 估计时长: ${(mergedData.length / this.targetSampleRate).toFixed(2)}秒`);
-
-              // 使用setTimeout避免栈溢出
-              setTimeout(() => {
-                try {
-                  this.callbacks.onAudioData(mergedData);
-                } catch (callbackError) {
-                  console.error('回调执行出错:', callbackError);
-                  console.error('错误调用栈:', callbackError.stack);
-                }
-              }, 0);
-            }
-          } catch (mergeError) {
-            console.error('合并音频数据出错:', mergeError);
-            console.error('错误调用栈:', mergeError.stack);
-          }
-        }
-      } else {
-        console.log('没有剩余的音频数据需要处理');
-      }
-    } catch (error) {
-      console.error(`处理剩余音频数据时出错: ${error.message}`, error);
-    } finally {
-      // 无论如何都要清理资源
-      this.isRecording = false;
-
-      if (this.audioProcessor) {
+    // 断开音频处理器
+    if (this.audioProcessor) {
+      try {
         this.audioProcessor.disconnect();
         this.audioProcessor = null;
+      } catch (error) {
+        console.error('断开音频处理器失败:', error);
       }
+    }
 
-      if (this.processingInterval) {
-        clearInterval(this.processingInterval);
-        this.processingInterval = null;
-      }
-
-      this.audioQueue = [];
+    // 处理剩余的音频数据
+    if (this.audioQueue.length > 0) {
+      console.log(`处理剩余的音频数据: ${this.audioQueue.length} 块`);
+      this._processAudioQueue();
+    } else {
+      console.log('没有剩余的音频数据需要处理');
     }
   }
 
-  startRecording() {
-    if (!this.audioStream || this.isRecording) return false;
+  // 添加新方法，处理音频队列
+  _processAudioQueue() {
+    try {
+      if (this.audioQueue.length === 0) {
+        console.log('音频队列为空，无需处理');
+        return;
+      }
+
+      // 计算队列中的总样本数
+      const totalLength = this.audioQueue.reduce((acc, curr) => acc + curr.length, 0);
+      console.log(`处理音频队列: ${this.audioQueue.length} 块, 共 ${totalLength} 样本`);
+
+      // 合并音频数据
+      const mergedData = new Float32Array(totalLength);
+      let offset = 0;
+      for (const audioData of this.audioQueue) {
+        mergedData.set(audioData, offset);
+        offset += audioData.length;
+      }
+
+      // 清空队列
+      this.audioQueue = [];
+      this.accumulatedSamples = 0;
+
+      // 重采样到目标采样率
+      const resampledData = this.resampleAudio(mergedData, this.actualSampleRate, this.targetSampleRate);
+      console.log(`重采样结果: 从 ${mergedData.length} 样本 (${this.actualSampleRate}Hz) 到 ${resampledData.length} 样本 (${this.targetSampleRate}Hz)`);
+
+      // 发送合并后的音频数据
+      if (this.callbacks.onAudioData) {
+        console.log(`发送音频数据到回调: ${resampledData.length} 样本, 估计时长: ${(resampledData.length / this.targetSampleRate).toFixed(2)}秒`);
+        
+        // 使用setTimeout避免同步调用栈过深
+        setTimeout(() => {
+          try {
+            this.callbacks.onAudioData(resampledData);
+          } catch (callbackError) {
+            console.error('回调执行出错:', callbackError);
+            console.error('错误调用栈:', callbackError.stack);
+          }
+        }, 0);
+      } else {
+        console.warn('onAudioData 回调未设置，无法发送音频数据');
+      }
+    } catch (error) {
+      console.error('处理音频队列出错:', error);
+      console.error('错误调用栈:', error.stack);
+    }
+  }  
+
+  async startRecording() {
+    if (this.isRecording) return;
 
     try {
+      // 确保音频已初始化
+      if (!this.audioContext || !this.audioStream) {
+        const initialized = await this.initAudio();
+        if (!initialized) {
+          throw new Error('无法初始化音频');
+        }
+      }
+
+      // 如果音频上下文被挂起，恢复它
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume();
+      }
+
+      // 设置录音状态
       this.isRecording = true;
-      this.consecutiveSilenceTime = 0;
-      this.lastAudioTime = Date.now();
       this.paused = false;
       this.consecutiveSilenceBlocks = 0;
+      this.audioQueue = [];
       this.accumulatedSamples = 0;
-      this.lastActiveTime = Date.now();
-      this.audioQueue = []; // 确保队列为空
 
-      // 创建音频处理节点
+      // 创建音频源
       const source = this.audioContext.createMediaStreamSource(this.audioStream);
-      this.audioProcessor = this.audioContext.createScriptProcessor(this.audioBufferSize, 1, 1);
 
-      // 连接节点
-      source.connect(this.audioProcessor);
-      this.audioProcessor.connect(this.audioContext.destination);
+      // 创建脚本处理器节点，确保缓冲区大小是有效的
+      const bufferSize = 4096; // 使用较小的缓冲区大小，提高响应速度
+      console.log(`创建ScriptProcessor节点，缓冲区大小: ${bufferSize}`);
+      
+      this.audioProcessor = this.audioContext.createScriptProcessor(
+        bufferSize, // 输入缓冲区大小
+        1, // 单声道输入
+        1  // 单声道输出
+      );
+
+      // 添加调试日志
+      console.log('音频处理器创建完成，设置onaudioprocess事件处理器');
 
       // 处理音频数据
       this.audioProcessor.onaudioprocess = (e) => {
-        if (!this.isRecording) return;
+        if (!this.isRecording) {
+          console.log('录音已停止，不再处理音频数据');
+          return;
+        }
 
         const inputData = e.inputBuffer.getChannelData(0);
         const audioData = new Float32Array(inputData);
@@ -345,34 +339,13 @@ class AudioService {
         // 添加调试日志，确认音频处理器正在接收数据
         console.log(`接收到音频数据: ${audioData.length} 样本`);
 
-        // 检查音频数据是否有效
-        let isValid = true;
-        for (let i = 0; i < audioData.length; i++) {
-          if (isNaN(audioData[i]) || !isFinite(audioData[i])) {
-            isValid = false;
-            break;
-          }
-        }
-
-        if (!isValid) {
-          console.warn('检测到无效的音频数据，跳过此帧');
-          return;
-        }
-
         // 计算音量
         const volume = this.calculateVolume(audioData);
+        console.log(`当前音量: ${volume.toFixed(6)}, 静音阈值: ${this.silenceThreshold}`);
 
         if (this.callbacks.onVolumeChange) {
           this.callbacks.onVolumeChange(volume);
         }
-
-        // 添加调试日志，显示当前音量
-        console.log(`当前音量: ${volume.toFixed(6)}, 静音阈值: ${this.silenceThreshold}`);
-
-        // 检测静音 - 改进的静音检测逻辑
-        const isSilent = volume < this.silenceThreshold;
-        const currentTime = Date.now();
-        const blockDuration = (audioData.length / this.audioContext.sampleRate) * 1000;
 
         // 无论是否静音，都将音频数据添加到队列中
         this.audioQueue.push(audioData);
@@ -383,62 +356,28 @@ class AudioService {
         const queueDuration = (totalLength / this.audioContext.sampleRate) * 1000;
         console.log(`当前队列状态: ${this.audioQueue.length} 块, ${totalLength} 样本, 估计时长: ${queueDuration.toFixed(2)}ms`);
 
+        // 检测静音
+        const isSilent = volume < this.silenceThreshold;
+
         if (isSilent) {
           this.consecutiveSilenceBlocks++;
           console.log(`检测到静音块 #${this.consecutiveSilenceBlocks}, 音量: ${volume.toFixed(6)}`);
-
-          // 计算连续静音时间
-          const silenceTime = this.consecutiveSilenceBlocks * blockDuration;
-
-          // 如果连续静音时间超过阈值且录音未暂停
-          if (silenceTime >= this.silenceDuration && !this.paused) {
-            console.log(`检测到连续静音超过 ${this.silenceDuration}ms，暂停录音`);
-            this.paused = true;
-
-            // 发送静音检测事件
-            if (this.callbacks.onSilenceDetected) {
-              this.callbacks.onSilenceDetected();
-            }
-
-            // 如果队列中有足够的数据，强制处理一次
-            if (this.audioQueue.length > 0 && queueDuration >= 1000) {
-              console.log(`静音触发，处理队列中的 ${this.audioQueue.length} 块音频数据`);
-
-              const mergedData = new Float32Array(totalLength);
-
-              let offset = 0;
-              for (const audioData of this.audioQueue) {
-                mergedData.set(audioData, offset);
-                offset += audioData.length;
-              }
-
-              // 重采样到目标采样率
-              const resampledData = this.resampleAudio(mergedData, this.actualSampleRate, this.targetSampleRate);
-
-              // 发送合并后的音频数据
-              if (this.callbacks.onAudioData) {
-                console.log(`发送音频数据到回调: ${resampledData.length} 样本, 估计时长: ${(resampledData.length / this.targetSampleRate).toFixed(2)}秒`);
-                this.callbacks.onAudioData(resampledData);
-              } else {
-                console.warn('onAudioData 回调未设置，无法发送音频数据');
-              }
-
-              // 清空队列
-              this.audioQueue = [];
-              this.accumulatedSamples = 0;
-            }
-          }
         } else {
           // 如果当前块不是静音
-          if (this.paused) {
-            console.log('检测到活动音频，恢复录音');
-            this.paused = false;
-          }
-
           this.consecutiveSilenceBlocks = 0;
-          this.lastActiveTime = currentTime;
+          this.lastActiveTime = Date.now();
+        }
+
+        // 如果队列中的音频数据已经足够长，处理它
+        if (queueDuration >= 1000) { // 降低到1秒，更快地处理音频
+          console.log(`队列中的音频数据已达到1秒，处理音频`);
+          this._processAudioQueue();
         }
       };
+
+      // 连接节点 - 确保在设置onaudioprocess后再连接
+      source.connect(this.audioProcessor);
+      this.audioProcessor.connect(this.audioContext.destination);
 
       // 启动音频处理
       this.startAudioProcessing();
@@ -452,7 +391,6 @@ class AudioService {
     }
   }
 
-  // 优化 startAudioProcessing 方法，避免栈溢出
   startAudioProcessing() {
     if (this.processingInterval) {
       clearInterval(this.processingInterval);
@@ -460,12 +398,13 @@ class AudioService {
 
     console.log('开始音频处理...');
 
-    // 使用较长的间隔时间，减少处理频率
-    const PROCESSING_INTERVAL = 1000; // 1秒处理一次
+    // 使用较短的间隔时间，提高响应速度
+    const PROCESSING_INTERVAL = 2000; // 2秒处理一次
 
     this.processingInterval = setInterval(() => {
       try {
         if (!this.isRecording || this.paused) {
+          console.log('录音已停止或暂停，跳过处理');
           return;
         }
 
@@ -477,46 +416,20 @@ class AudioService {
 
         // 计算队列中的总样本数
         const totalSamples = this.audioQueue.reduce((acc, curr) => acc + curr.length, 0);
+        const durationSec = totalSamples / this.actualSampleRate;
+        
+        console.log(`当前队列状态: ${this.audioQueue.length} 块, ${totalSamples} 样本, 估计时长: ${durationSec.toFixed(2)}秒`);
 
         // 如果累积的样本数太少，等待更多数据
-        const minSamples = this.targetSampleRate * 1; // 至少1秒的音频
-        if (totalSamples < minSamples) {
-          console.log(`累积的样本数 (${totalSamples}) 不足 ${minSamples}，等待更多数据...`);
+        if (durationSec < 1) { // 降低到1秒，更快地处理音频
+          console.log(`累积的音频时长 (${durationSec.toFixed(2)}秒) 不足1秒，等待更多数据...`);
           return;
         }
 
-        console.log(`处理音频队列: ${this.audioQueue.length} 块, 共 ${totalSamples} 样本`);
-
-        // 合并音频数据
-        const mergedData = new Float32Array(totalSamples);
-        let offset = 0;
-
-        // 使用循环而不是forEach，避免回调函数开销
-        for (let i = 0; i < this.audioQueue.length; i++) {
-          const audioData = this.audioQueue[i];
-          mergedData.set(audioData, offset);
-          offset += audioData.length;
-        }
-
-        // 清空队列
-        this.audioQueue = [];
-
-        // 重要：添加重采样步骤
-        const resampledData = this.resampleAudio(mergedData, this.actualSampleRate, this.targetSampleRate);
-        console.log(`重采样结果: 从 ${mergedData.length} 样本 (${this.actualSampleRate}Hz) 到 ${resampledData.length} 样本 (${this.targetSampleRate}Hz)`);
-
-        // 使用setTimeout将回调放入事件队列，避免同步调用栈过深
-        setTimeout(() => {
-          try {
-            if (this.callbacks.onAudioData) {
-              // 修复：使用重采样后的数据而不是原始数据
-              this.callbacks.onAudioData(resampledData);
-            }
-          } catch (callbackError) {
-            console.error('音频数据回调执行出错:', callbackError);
-            console.error('回调错误调用栈:', callbackError.stack);
-          }
-        }, 0);
+        console.log(`处理音频队列: ${this.audioQueue.length} 块, 共 ${totalSamples} 样本, 时长: ${durationSec.toFixed(2)}秒`);
+        
+        // 处理音频队列
+        this._processAudioQueue();
       } catch (error) {
         console.error('音频处理出错:', error);
         console.error('处理错误调用栈:', error.stack);
@@ -524,21 +437,40 @@ class AudioService {
     }, PROCESSING_INTERVAL);
   }
 
-
   calculateVolume(audioData) {
-    // 计算音频数据的平均绝对值作为音量
-    let sum = 0;
-    let validSamples = 0;
-
-    for (let i = 0; i < audioData.length; i++) {
-      const sample = audioData[i];
-      if (!isNaN(sample) && isFinite(sample)) {
-        sum += Math.abs(sample);
-        validSamples++;
-      }
+    if (!audioData || audioData.length === 0) {
+      return 0;
     }
 
-    return validSamples > 0 ? sum / validSamples : 0;
+    try {
+      // 计算RMS值
+      let sumSquares = 0;
+      let validSamples = 0;
+
+      for (let i = 0; i < audioData.length; i++) {
+        const sample = audioData[i];
+        if (!isNaN(sample) && isFinite(sample)) {
+          sumSquares += sample * sample;
+          validSamples++;
+        }
+      }
+
+      if (validSamples === 0) {
+        return 0;
+      }
+
+      const rms = Math.sqrt(sumSquares / validSamples);
+      
+      // 添加调试日志
+      if (rms > this.silenceThreshold) {
+        console.log(`检测到有效音频: RMS=${rms.toFixed(6)}`);
+      }
+      
+      return rms;
+    } catch (error) {
+      console.error('计算音量失败:', error);
+      return 0;
+    }
   }
 
   // 修改playAudio方法
@@ -849,30 +781,41 @@ class AudioService {
     }
   }
 
-  // 将Float32Array直接发送，不转换为WAV
-  prepareAudioForSending(samples) {
+  // 准备音频数据用于发送
+  prepareAudioForSending(audioData) {
     try {
-      console.log(`准备发送音频: ${samples.length} 样本, 采样率: ${this.targetSampleRate}Hz`);
-
-      // 确保采样率正确
-      if (this.actualSampleRate !== this.targetSampleRate) {
-        // 如果需要重采样，使用现有的重采样方法
-        samples = this.resampleAudio(samples, this.actualSampleRate, this.targetSampleRate);
+      if (!audioData || audioData.length === 0) {
+        console.error('无效的音频数据');
+        return null;
       }
 
-      // 创建一个ArrayBuffer来存储float32数据
-      const buffer = new ArrayBuffer(samples.length * 4); // 每个float32值占4字节
-      const view = new Float32Array(buffer);
+      console.log(`准备发送音频: ${audioData.length} 样本, 采样率: ${this.targetSampleRate}Hz`);
 
-      // 复制数据
-      for (let i = 0; i < samples.length; i++) {
-        view[i] = samples[i];
+      // 确保音频数据是Float32Array类型
+      let dataToSend = audioData;
+      if (!(dataToSend instanceof Float32Array)) {
+        console.warn('音频数据不是Float32Array类型，进行转换');
+        dataToSend = new Float32Array(dataToSend);
       }
 
+      // 确保音频数据范围在[-1, 1]之间
+      const maxAbs = Math.max(...Array.from(dataToSend.slice(0, Math.min(10000, dataToSend.length))).map(Math.abs));
+      if (maxAbs > 1.0) {
+        for (let i = 0; i < dataToSend.length; i++) {
+          dataToSend[i] /= maxAbs;
+        }
+        console.debug(`已归一化音频数据，系数: ${maxAbs.toFixed(4)}`);
+      }
+
+      // 创建ArrayBuffer并将Float32Array数据复制进去
+      const buffer = new ArrayBuffer(dataToSend.length * 4); // 每个float32值占4字节
+      const floatView = new Float32Array(buffer);
+      floatView.set(dataToSend);
+      
       // 创建Blob对象
       const blob = new Blob([buffer], { type: 'application/octet-stream' });
+      
       console.log(`音频准备完成: 大小 ${blob.size} 字节`);
-
       return blob;
     } catch (error) {
       console.error('准备音频数据失败:', error);

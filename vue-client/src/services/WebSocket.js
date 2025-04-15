@@ -154,29 +154,84 @@ class WebSocketService {
       if (data instanceof Blob) {
         console.log(`发送二进制数据: ${data.size} 字节, 类型: ${data.type}`);
         
-        // 添加前缀"AUDIO:"，与Python客户端保持一致
-        // 创建一个新的Blob，包含前缀和原始数据
-        const prefix = 'AUDIO:';
-        const prefixBlob = new Blob([prefix], { type: 'text/plain' });
-        const combinedBlob = new Blob([prefixBlob, data], { type: data.type });
+        // 读取Blob数据并转换为Float32Array
+        return new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = async () => {
+            // 获取ArrayBuffer
+            const arrayBuffer = reader.result;
+            
+            // 如果是WAV文件，需要跳过44字节的WAV头
+            let audioData;
+            if (data.type === 'audio/wav') {
+              // 跳过WAV头部(44字节)，只获取音频数据部分
+              const dataView = new DataView(arrayBuffer.slice(44));
 
-        // 直接发送Blob数据，不尝试转换
-        this.socket.send(combinedBlob);
-        return true;
+              // 将16位整数数据转换为float32
+              audioData = new Float32Array(dataView.byteLength / 2);
+              for (let i = 0; i < audioData.length; i++) {
+                // 从WAV中读取16位整数并转换为-1到1范围的浮点数
+                audioData[i] = dataView.getInt16(i * 2, true) / 32768.0;
+              }              
+            } else {
+              // 直接获取Float32Array数据
+              audioData = new Float32Array(arrayBuffer);
+            }
+
+            // 跳过空音频数据
+            if (audioData.length === 0) {
+              console.debug("尝试发送空音频缓冲区，已跳过");
+              resolve(false);
+              return;
+            }       
+            
+            try {
+              // 将Float32Array转换为二进制数据
+              let encodedAudio = '';
+              const buffer = new ArrayBuffer(audioData.length * 4);
+              const view = new DataView(buffer);
+              
+              // 将每个float32值写入buffer
+              for (let i = 0; i < audioData.length; i++) {
+                view.setFloat32(i * 4, audioData[i], true); // true表示小端字节序
+              }
+              
+              // 将二进制数据转换为latin1编码的字符串
+              const bytes = new Uint8Array(buffer);
+              for (let i = 0; i < bytes.length; i++) {
+                encodedAudio += String.fromCharCode(bytes[i]);
+              }
+              
+              // 添加"AUDIO:"前缀
+              const message = `AUDIO:${encodedAudio}`;
+              
+              // 发送消息
+              console.log(`发送音频数据: ${audioData.length} 样本, 编码后大小: ${message.length} 字节, 估计时长: ${(audioData.length / AudioService.targetSampleRate).toFixed(2)}秒`);
+              this.socket.send(message);
+              resolve(true);
+            } catch (error) {
+              console.error('发送音频数据时出错:', error);
+              console.error('错误调用栈:', error.stack);
+              resolve(false);
+            }
+          };
+          reader.onerror = () => {
+            console.error('读取Blob数据失败');
+            resolve(false);
+          };
+          reader.readAsArrayBuffer(data);
+        });
       } else if (typeof data === 'string') {
-        console.log(`发送文本消息: ${data.substring(0, 50)}${data.length > 50 ? '...' : ''}`);
+        console.log(`发送文本消息: ${data}`);
         this.socket.send(data);
-        return true;
+        return Promise.resolve(true);
       } else {
-        // 对象类型，转为JSON
-        const messageString = JSON.stringify(data);
-        console.log(`发送JSON消息: ${messageString.substring(0, 50)}${messageString.length > 50 ? '...' : ''}`);
-        this.socket.send(messageString);
-        return true;
+        console.error(`不支持的数据类型: ${typeof data}`);
+        return Promise.resolve(false);
       }
     } catch (error) {
-      console.error('发送数据失败:', error);
-      return false;
+      console.error('发送数据时出错:', error);
+      return Promise.resolve(false);
     }
   }
 
