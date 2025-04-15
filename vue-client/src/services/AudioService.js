@@ -7,7 +7,8 @@ class AudioService {
     this.isRecording = false;
     this.silenceDetector = null;
     this.audioProcessor = null;
-    this.silenceThreshold = 0.01;
+
+    this.silenceThreshold = 0.1;
     this.silenceDuration = 5000; // 5秒
     this.consecutiveSilenceTime = 0;
     this.lastAudioTime = 0;
@@ -29,7 +30,71 @@ class AudioService {
     this.targetSampleRate = 16000; // 目标采样率
     this.actualSampleRate = null; // 实际采样率，将在初始化时设置
     this.fileSystemInitialized = false; // 添加新标志，表示文件系统是否已成功初始化
-    this.debugDirHandle = null; // 确保变量已定义    
+    this.debugDirHandle = null; // 确保变量已定义
+
+    // 添加调试计数器，匹配client.py中的debug_counter
+    this.debugCounter = 0;
+
+    // 添加VAD参数，匹配client.py中的AudioSender
+    this.vadThreshold = 0.015; // VAD阈值
+    this.minSpeechDuration = 0.3; // 最小语音段长度(秒)
+
+    // 添加回调统计
+    this.callbackCount = 0;
+  }
+
+  // 添加检测静音的方法，匹配client.py中的逻辑
+  detectSilence(audioData) {
+    if (!audioData || audioData.length === 0) {
+      return true;
+    }
+
+    // 计算音频能量
+    let sum = 0;
+    let max = 0;
+
+    for (let i = 0; i < audioData.length; i++) {
+      const amplitude = Math.abs(audioData[i]);
+      sum += amplitude * amplitude;
+      if (amplitude > max) {
+        max = amplitude;
+      }
+    }
+
+    const rms = Math.sqrt(sum / audioData.length);
+
+    // 检测是否为静音
+    const isSilent = max < this.silenceThreshold;
+
+    // 记录音频统计信息
+    console.log(`音频统计: RMS=${rms.toFixed(4)}, 最大值=${max.toFixed(4)}, 静音=${isSilent}`);
+
+    return isSilent;
+  }
+
+  // 添加处理静音的方法，匹配client.py中的逻辑
+  handleSilence(isSilent) {
+    const now = Date.now();
+
+    if (isSilent) {
+      this.consecutiveSilenceBlocks++;
+
+      // 如果连续静音超过阈值，触发静音检测回调
+      if (this.consecutiveSilenceBlocks >= 3 && now - this.lastActiveTime > this.silenceDuration) {
+        console.log(`检测到持续静音: ${this.consecutiveSilenceBlocks} 块, ${(now - this.lastActiveTime) / 1000}秒`);
+
+        if (this.callbacks.onSilenceDetected) {
+          this.callbacks.onSilenceDetected();
+        }
+
+        // 重置计数器
+        this.consecutiveSilenceBlocks = 0;
+      }
+    } else {
+      // 重置静音计数器和最后活动时间
+      this.consecutiveSilenceBlocks = 0;
+      this.lastActiveTime = now;
+    }
   }
 
   async initAudio() {
@@ -267,7 +332,7 @@ class AudioService {
       // 发送合并后的音频数据
       if (this.callbacks.onAudioData) {
         console.log(`发送音频数据到回调: ${resampledData.length} 样本, 估计时长: ${(resampledData.length / this.targetSampleRate).toFixed(2)}秒`);
-        
+
         // 使用setTimeout避免同步调用栈过深
         setTimeout(() => {
           try {
@@ -284,10 +349,13 @@ class AudioService {
       console.error('处理音频队列出错:', error);
       console.error('错误调用栈:', error.stack);
     }
-  }  
+  }
 
   async startRecording() {
-    if (this.isRecording) return;
+    if (this.isRecording) {
+      console.log('已经在录音中');
+      return;
+    }
 
     try {
       // 确保音频已初始化
@@ -298,33 +366,20 @@ class AudioService {
         }
       }
 
-      // 如果音频上下文被挂起，恢复它
-      if (this.audioContext.state === 'suspended') {
-        await this.audioContext.resume();
-      }
-
-      // 设置录音状态
+      // 重置状态
       this.isRecording = true;
       this.paused = false;
       this.consecutiveSilenceBlocks = 0;
-      this.audioQueue = [];
-      this.accumulatedSamples = 0;
+      this.lastActiveTime = Date.now();
+      this.callbackCount = 0;
+
 
       // 创建音频源
       const source = this.audioContext.createMediaStreamSource(this.audioStream);
 
-      // 创建脚本处理器节点，确保缓冲区大小是有效的
-      const bufferSize = 4096; // 使用较小的缓冲区大小，提高响应速度
-      console.log(`创建ScriptProcessor节点，缓冲区大小: ${bufferSize}`);
-      
-      this.audioProcessor = this.audioContext.createScriptProcessor(
-        bufferSize, // 输入缓冲区大小
-        1, // 单声道输入
-        1  // 单声道输出
-      );
+      // 使用ScriptProcessorNode处理音频
+      this.audioProcessor = this.audioContext.createScriptProcessor(this.audioBufferSize, 1, 1);
 
-      // 添加调试日志
-      console.log('音频处理器创建完成，设置onaudioprocess事件处理器');
 
       // 处理音频数据
       this.audioProcessor.onaudioprocess = (e) => {
@@ -334,10 +389,12 @@ class AudioService {
         }
 
         const inputData = e.inputBuffer.getChannelData(0);
-        const audioData = new Float32Array(inputData);
+        // 增加回调计数
+        this.callbackCount++;
 
-        // 添加调试日志，确认音频处理器正在接收数据
-        console.log(`接收到音频数据: ${audioData.length} 样本`);
+        const audioData = new Float32Array(inputData);
+        audioData.set(inputData);
+
 
         // 计算音量
         const volume = this.calculateVolume(audioData);
@@ -347,49 +404,58 @@ class AudioService {
           this.callbacks.onVolumeChange(volume);
         }
 
-        // 无论是否静音，都将音频数据添加到队列中
-        this.audioQueue.push(audioData);
-        this.accumulatedSamples += audioData.length;
+        // 检测是否为静音
+        const isSilent = this.detectSilence(audioData);
 
-        // 添加调试日志，显示队列状态
-        const totalLength = this.audioQueue.reduce((acc, curr) => acc + curr.length, 0);
-        const queueDuration = (totalLength / this.audioContext.sampleRate) * 1000;
-        console.log(`当前队列状态: ${this.audioQueue.length} 块, ${totalLength} 样本, 估计时长: ${queueDuration.toFixed(2)}ms`);
+        // 处理静音
+        this.handleSilence(isSilent);        
 
-        // 检测静音
-        const isSilent = volume < this.silenceThreshold;
-
-        if (isSilent) {
-          this.consecutiveSilenceBlocks++;
-          console.log(`检测到静音块 #${this.consecutiveSilenceBlocks}, 音量: ${volume.toFixed(6)}`);
-        } else {
-          // 如果当前块不是静音
-          this.consecutiveSilenceBlocks = 0;
-          this.lastActiveTime = Date.now();
-        }
-
-        // 如果队列中的音频数据已经足够长，处理它
-        if (queueDuration >= 1000) { // 降低到1秒，更快地处理音频
-          console.log(`队列中的音频数据已达到1秒，处理音频`);
-          this._processAudioQueue();
+        
+        // 如果不是静音或者我们仍然想要处理静音数据
+        if (!this.paused) {
+          // 重采样到目标采样率
+          let processedData = audioData;
+          if (this.actualSampleRate !== this.targetSampleRate) {
+            processedData = this.resampleAudio(audioData, this.actualSampleRate, this.targetSampleRate);
+          }
+          
+          // 保存调试音频
+          this.saveDebugAudio(processedData);
+          
+          // 触发音频数据回调
+          if (this.callbacks.onAudioData) {
+            this.callbacks.onAudioData(processedData);
+          }
         }
       };
 
-      // 连接节点 - 确保在设置onaudioprocess后再连接
+      // 连接节点
       source.connect(this.audioProcessor);
       this.audioProcessor.connect(this.audioContext.destination);
-
-      // 启动音频处理
-      this.startAudioProcessing();
-
-      console.log('录音已开始，音频处理器已设置');
+      
+      console.log('开始录音，采样率:', this.actualSampleRate, '目标采样率:', this.targetSampleRate);
       return true;
     } catch (error) {
       console.error('开始录音失败:', error);
+      console.error('错误调用栈:', error.stack);
       this.isRecording = false;
-      return false;
     }
   }
+
+  // 添加保存调试音频的方法
+  saveDebugAudio(audioData) {
+    try {
+      // 每10个回调保存一次，避免过多文件
+      if (this.callbackCount % 10 !== 0) return;
+      
+      this.debugCounter++;
+      const wavBlob = this.float32ToWav(audioData, this.targetSampleRate);
+      this.saveDebugWavFile(wavBlob, `input_${this.debugCounter}`);
+    } catch (error) {
+      console.error('保存调试音频失败:', error);
+    }
+  }
+
 
   startAudioProcessing() {
     if (this.processingInterval) {
@@ -417,7 +483,7 @@ class AudioService {
         // 计算队列中的总样本数
         const totalSamples = this.audioQueue.reduce((acc, curr) => acc + curr.length, 0);
         const durationSec = totalSamples / this.actualSampleRate;
-        
+
         console.log(`当前队列状态: ${this.audioQueue.length} 块, ${totalSamples} 样本, 估计时长: ${durationSec.toFixed(2)}秒`);
 
         // 如果累积的样本数太少，等待更多数据
@@ -427,7 +493,7 @@ class AudioService {
         }
 
         console.log(`处理音频队列: ${this.audioQueue.length} 块, 共 ${totalSamples} 样本, 时长: ${durationSec.toFixed(2)}秒`);
-        
+
         // 处理音频队列
         this._processAudioQueue();
       } catch (error) {
@@ -460,12 +526,12 @@ class AudioService {
       }
 
       const rms = Math.sqrt(sumSquares / validSamples);
-      
+
       // 添加调试日志
       if (rms > this.silenceThreshold) {
         console.log(`检测到有效音频: RMS=${rms.toFixed(6)}`);
       }
-      
+
       return rms;
     } catch (error) {
       console.error('计算音量失败:', error);
@@ -553,23 +619,23 @@ class AudioService {
 
       // 确保audioBlob是WAV格式
       let wavBlob = audioBlob;
-      
+
       // 如果audioBlob不是WAV格式，需要转换
       if (audioBlob.type !== 'audio/wav') {
         console.log('转换音频数据为WAV格式...');
-        
+
         // 从Blob中读取Float32Array数据
         const arrayBuffer = await audioBlob.arrayBuffer();
         const floatData = new Float32Array(arrayBuffer);
-        
+
         // 使用float32ToWav方法转换为WAV格式
         wavBlob = this.float32ToWav(floatData, this.targetSampleRate);
-        
+
         if (!wavBlob) {
           console.error('转换为WAV格式失败');
           return null;
         }
-      }      
+      }
 
       // 生成文件名
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -811,10 +877,10 @@ class AudioService {
       const buffer = new ArrayBuffer(dataToSend.length * 4); // 每个float32值占4字节
       const floatView = new Float32Array(buffer);
       floatView.set(dataToSend);
-      
+
       // 创建Blob对象
       const blob = new Blob([buffer], { type: 'application/octet-stream' });
-      
+
       console.log(`音频准备完成: 大小 ${blob.size} 字节`);
       return blob;
     } catch (error) {

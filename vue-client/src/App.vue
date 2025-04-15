@@ -50,6 +50,15 @@
             {{ isRecording ? '停止录音' : '开始录音' }}
           </button>
         </div>
+        <!-- 添加服务器音频播放状态 -->
+        <div class="mb-6" v-if="isPlayingServerAudio">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-gray-700 font-medium">服务器音频:</span>
+            <span class="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm font-medium animate-pulse">
+              正在播放服务器音频...
+            </span>
+          </div>
+        </div>
 
         <!-- 音量指示器 -->
         <div class="mt-4">
@@ -122,6 +131,7 @@ export default {
     const serverUrl = ref('ws://localhost:8765');
     const isConnected = ref(false);
     const isRecording = ref(false);
+    const isPlayingServerAudio = ref(false); // 添加新状态
     const transcription = ref('');
     const status = ref('');
     const volume = ref(0);
@@ -307,7 +317,7 @@ export default {
       }
     };
 
-    // 修改 toggleRecording 函数，增加错误处理
+    // 修改 toggleRecording 函数，增加错误处理和匹配client.py的逻辑
     const toggleRecording = async () => {
       if (!isConnected.value) {
         addLog('warning', '请先连接到服务器');
@@ -326,6 +336,10 @@ export default {
           AudioService.stopRecording();
           isRecording.value = false;
           addLog('info', '已停止录音');
+
+          // 重置静音检测状态
+          AudioService.consecutiveSilenceBlocks = 0;
+          AudioService.lastActiveTime = Date.now();
         } catch (error) {
           addLog('error', `停止录音时出错: ${error.message}`);
           // 确保录音状态正确
@@ -352,7 +366,7 @@ export default {
               addLog('error', '初始化音频失败');
               return;
             }
-            addLog('info', '音频初始化成功');
+            addLog('info', `音频初始化成功，采样率: ${AudioService.actualSampleRate}Hz`);
           }
 
           // 确保回调已设置
@@ -369,6 +383,10 @@ export default {
           if (success) {
             isRecording.value = true;
             addLog('info', '开始录音');
+
+            // 重置静音检测状态
+            AudioService.consecutiveSilenceBlocks = 0;
+            AudioService.lastActiveTime = Date.now();
           } else {
             addLog('error', '开始录音失败');
           }
@@ -399,94 +417,152 @@ export default {
     // 修改setupWebSocketCallbacks函数
     const setupWebSocketCallbacks = () => {
       WebSocketService.setCallbacks({
-        onMessage: (event) => {
-          if (!(event.data instanceof Blob)) {
-            addLog('info', `收到消息: ${event.data}`);
-          } else {
-            addLog('info', `收到音频数据: ${event.data.size} 字节`);
-          }
+        onConnect: () => {
+          isConnected.value = true;
+          addLog('info', '已成功连接到服务器');
         },
-        // 在 onAudioData 回调中
-        onAudioData: (audioData) => {
+        onDisconnect: () => {
+          isConnected.value = false;
+          isRecording.value = false;
+          AudioService.stopRecording();
+          addLog('warning', '与服务器的连接已断开');
+        },
+        onError: (error) => {
+          addLog('error', `WebSocket错误: ${error.message || '未知错误'}`);
+        },
+        onMessage: (message) => {
+          addLog('info', `收到消息: ${message}`);
+        },
+        // 修改 onAudioData 回调处理，匹配client.py中的逻辑
+        onAudioData: (audioData, isServerAudio = false) => {
           try {
-            console.log(`音频回调触发: 收到 ${audioData.length} 样本的音频数据`);
 
-            if (isRecording.value && isConnected.value) {
-              try {
-                // 记录音频统计信息，帮助调试
-                // 使用setTimeout避免同步调用栈过深
-                setTimeout(() => {
-                  try {
-                    const stats = AudioService.logAudioStats(audioData);
-                    if (stats && !stats.isSilent) {
-                      addLog('info', `音频统计: RMS=${stats.rms.toFixed(4)}, 最大值=${stats.max.toFixed(4)}, 最小值=${stats.min.toFixed(4)}`);
-                    }
-                  } catch (statsError) {
-                    console.error('记录音频统计信息失败:', statsError);
-                    console.error('统计错误调用栈:', statsError.stack);
-                  }
-                }, 0);
-              } catch (statsError) {
-                console.error('记录音频统计信息失败:', statsError);
-                console.error('统计错误调用栈:', statsError.stack);
-              }
+            // 如果是服务器发送的音频，直接播放，不需要检查录音状态
+            if (isServerAudio) {
+              isPlayingServerAudio.value = true;
+              console.log(`收到服务器音频数据: ${audioData.size} 字节`);
+              addLog('info', `收到服务器音频数据: ${audioData.size} 字节，准备播放`);
 
-              // 计算音频时长
-              const durationSec = audioData.length / AudioService.targetSampleRate;
+              // 播放接收到的音频
+              const reader = new FileReader();
+              reader.onload = async () => {
+                try {
+                  const arrayBuffer = reader.result;
 
-              // 将Float32Array转换为服务端可处理的格式
-              let audioBlob;
-              try {
-                audioBlob = AudioService.prepareAudioForSending(audioData);
-                if (!audioBlob) {
-                  addLog('error', '音频数据准备失败');
-                  return;
+                  // 创建音频上下文
+                  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+                  // 解码音频数据
+                  audioContext.decodeAudioData(arrayBuffer, (buffer) => {
+                    // 创建音频源
+                    const source = audioContext.createBufferSource();
+                    source.buffer = buffer;
+
+                    // 连接到输出设备
+                    source.connect(audioContext.destination);
+
+                    // 播放完成时通知服务器
+                    source.onended = () => {
+                      isPlayingServerAudio.value = false;
+                      WebSocketService.send("playback_finished").then(() => {
+                        console.log("playback_finished 播放服务端音频完毕");
+                        addLog('info', "播放服务端音频完毕");
+                      }).catch(error => {
+                        console.error("发送playback_finished失败:", error);
+                      });
+                    };
+
+                    // 播放音频
+                    source.start(0);
+
+                    const durationSec = buffer.duration;
+                    addLog('info', `正在播放服务器音频: ${durationSec.toFixed(2)}秒`);
+                  }, (error) => {
+                    addLog('error', `解码服务器音频失败: ${error}`);
+                    // 即使解码失败也要通知服务器播放完成
+                    WebSocketService.send("playback_finished").catch(error => {
+                      console.error("发送playback_finished失败:", error);
+                    });
+                  });
+                } catch (error) {
+                  addLog('error', `处理服务器音频数据失败: ${error.message}`);
+                  console.error('处理音频错误调用栈:', error.stack);
+                  // 出错时也要通知服务器播放完成
+                  WebSocketService.send("playback_finished").catch(error => {
+                    console.error("发送playback_finished失败:", error);
+                  });
                 }
-              } catch (conversionError) {
-                addLog('error', `音频转换失败: ${conversionError.message}`);
-                console.error('转换错误调用栈:', conversionError.stack);
-                return;
-              }
-
-              // 添加音频时长估计
-              addLog('info', `处理音频数据: ${audioData.length} 样本, 估计时长: ${durationSec.toFixed(2)}秒`);
-
-              // 保存调试音频
-              try {
-                // 使用Promise.resolve().then()将操作放入微任务队列
-                Promise.resolve().then(() => {
-                  // 先将audioData转换为WAV格式
-                  const wavBlob = AudioService.float32ToWav(audioData, AudioService.targetSampleRate);
-                  return AudioService.saveDebugWavFile(wavBlob, 'send');
-                }).then(filename => {
-                  if (filename) {
-                    addLog('info', `已保存调试音频: ${filename}`);
-                  }
-                }).catch(error => {
-                  console.error('保存调试音频失败:', error);
+              };
+              reader.onerror = () => {
+                addLog('error', '读取服务器音频数据失败');
+                // 读取失败时也要通知服务器播放完成
+                WebSocketService.send("playback_finished").catch(error => {
+                  console.error("发送playback_finished失败:", error);
                 });
-              } catch (saveError) {
-                console.error('保存调试音频失败:', saveError);
-              }
+              };
+              reader.readAsArrayBuffer(audioData);
+              return;
+            }
 
-              // 添加音频时长估计
-              addLog('info', `准备发送音频数据: ${audioData.length} 样本, WAV大小: ${audioBlob.size} 字节, 估计时长: ${durationSec.toFixed(2)}秒`);
+            console.log(`音频回调触发: 收到 ${audioData ? audioData.length : 'undefined'} 样本的音频数据`);
 
-              // 发送音频数据
-              WebSocketService.send(audioBlob).then(success => {
-                if (success) {
-                  addLog('info', `已发送音频数据: ${audioBlob.size} 字节, 采样率: ${AudioService.targetSampleRate}Hz, 估计时长: ${durationSec.toFixed(2)}秒`);
-                } else {
-                  addLog('error', '发送音频数据失败');
-                }
-              }).catch(error => {
-                addLog('error', `发送音频数据失败: ${error.message}`);
-              });
-            } else {
+            // 检查音频数据是否有效
+            if (!audioData || audioData.length === 0) {
+              addLog('warning', '收到无效的音频数据');
+              return;
+            }
+
+            // 检查是否正在录音且已连接
+            if (!isRecording.value || !isConnected.value) {
               addLog('info', '忽略音频数据: 未录音或未连接');
+              return;
+            }
+
+            // 计算音频统计信息
+            const stats = AudioService.logAudioStats(audioData);
+            if (stats && !stats.isSilent) {
+              addLog('info', `音频统计: RMS=${stats.rms.toFixed(4)}, 最大值=${stats.max.toFixed(4)}, 最小值=${stats.min.toFixed(4)}`);
+            }
+
+            // 计算音频时长
+            const durationSec = audioData.length / AudioService.targetSampleRate;
+
+            // 将Float32Array转换为WAV格式
+            const wavBlob = AudioService.float32ToWav(audioData, AudioService.targetSampleRate);
+
+            // 保存调试音频
+            AudioService.saveDebugWavFile(wavBlob, 'received').then(filename => {
+              if (filename) {
+                addLog('info', `已保存接收到的调试音频: ${filename}`);
+              }
+            }).catch(error => {
+              console.error('保存调试音频失败:', error);
+            });
+
+            // 播放接收到的音频
+            try {
+              const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+              const reader = new FileReader();
+
+              reader.onload = () => {
+                audioContext.decodeAudioData(reader.result, (buffer) => {
+                  const source = audioContext.createBufferSource();
+                  source.buffer = buffer;
+                  source.connect(audioContext.destination);
+                  source.start(0);
+
+                  addLog('info', `正在播放接收到的音频: ${durationSec.toFixed(2)}秒`);
+                }, (error) => {
+                  addLog('error', `解码音频失败: ${error}`);
+                });
+              };
+
+              reader.readAsArrayBuffer(wavBlob);
+            } catch (playError) {
+              addLog('error', `播放音频失败: ${playError.message}`);
             }
           } catch (error) {
-            addLog('error', `处理音频数据时出错: ${error.message}`);
+            addLog('error', `处理接收到的音频数据失败: ${error.message}`);
             console.error('处理音频错误调用栈:', error.stack);
           }
         },
@@ -498,16 +574,11 @@ export default {
           status.value = newStatus;
           addLog('info', `状态更新: ${newStatus}`);
         },
-        onConnectionChange: (connected) => {
-          isConnected.value = connected;
-          if (!connected) {
-            isRecording.value = false;
-            AudioService.stopRecording();
-            addLog('warning', '与服务器的连接已断开');
+        onSilenceDetected: () => {
+          addLog('info', '检测到持续静音');
+          if (isRecording.value && isConnected.value) {
+            WebSocketService.send('SILENCE_DETECTED');
           }
-        },
-        onError: (error) => {
-          addLog('error', `WebSocket错误: ${error.message || '未知错误'}`);
         }
       });
     };

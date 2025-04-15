@@ -13,9 +13,24 @@ class WebSocketService {
       onMessage: null,
       onConnect: null,
       onDisconnect: null,
-      onError: null
+      onError: null,
+      onAudioData: null,
+      onTranscription: null,
+      onStatusChange: null
     };
     this.serverUrl = null;
+
+    // 添加静音检测相关变量，匹配client.py
+    this.lastActiveTime = Date.now(); // 上次检测到有效音频的时间
+    this.isSilent = false; // 当前是否处于静音状态
+    this.paused = false; // 录音是否已暂停
+    this.consecutiveSilenceBlocks = 0; // 连续静音块计数
+    this.silenceThreshold = 0.1; // 静音检测阈值
+    this.silenceDuration = 5000; // 静音持续5秒后停止录音
+
+    // 添加消息统计
+    this.messageCount = 0;
+    this.audioMessageCount = 0;
   }
 
   connect(url) {
@@ -30,6 +45,9 @@ class WebSocketService {
     try {
       this.socket = new WebSocket(url);
 
+      // 设置二进制类型为arraybuffer，而不是默认的blob
+      this.socket.binaryType = 'arraybuffer';
+
       this.socket.onopen = () => {
         console.log('WebSocket连接已建立');
         this.isConnected = true;
@@ -41,13 +59,28 @@ class WebSocketService {
 
       this.socket.onmessage = (event) => {
         try {
+          this.messageCount++;
+
           // 检查数据类型
-          if (event.data instanceof Blob) {
-            console.log(`收到二进制数据: ${event.data.size} 字节`);
+          if (event.data instanceof ArrayBuffer) {
+            const size = event.data.byteLength;
+            this.audioMessageCount++;
+            console.log(`收到二进制数据: ${size} 字节 (消息 #${this.messageCount}, 音频 #${this.audioMessageCount})`);
+
+            // 将ArrayBuffer转换为Blob以便于处理
+            const audioBlob = new Blob([event.data], { type: 'audio/wav' });
+
+            // 通知服务器开始播放音频
+            this.send("playback_started").then(() => {
+              console.log("playback_started 开始播放从服务端过来的音频");
+            }).catch(error => {
+              console.error("发送playback_started失败:", error);
+            });
+
             // 如果有处理二进制数据的回调，则调用它
             if (this.callbacks.onAudioData) {
-              this.callbacks.onAudioData(event.data);
-            }
+              this.callbacks.onAudioData(audioBlob, true); // 添加第二个参数表示这是服务器发送的音频
+            }            
           } else {
             // 尝试解析JSON
             try {
@@ -143,95 +176,40 @@ class WebSocketService {
     }
   }
 
-  send(data) {
-    if (!this.isConnected) {
+  async send(data) {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       console.error('WebSocket未连接，无法发送数据');
       return false;
     }
 
     try {
-      // 处理不同类型的数据
-      if (data instanceof Blob) {
-        console.log(`发送二进制数据: ${data.size} 字节, 类型: ${data.type}`);
-        
-        // 读取Blob数据并转换为Float32Array
-        return new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onload = async () => {
-            // 获取ArrayBuffer
-            const arrayBuffer = reader.result;
-            
-            // 如果是WAV文件，需要跳过44字节的WAV头
-            let audioData;
-            if (data.type === 'audio/wav') {
-              // 跳过WAV头部(44字节)，只获取音频数据部分
-              const dataView = new DataView(arrayBuffer.slice(44));
-
-              // 将16位整数数据转换为float32
-              audioData = new Float32Array(dataView.byteLength / 2);
-              for (let i = 0; i < audioData.length; i++) {
-                // 从WAV中读取16位整数并转换为-1到1范围的浮点数
-                audioData[i] = dataView.getInt16(i * 2, true) / 32768.0;
-              }              
-            } else {
-              // 直接获取Float32Array数据
-              audioData = new Float32Array(arrayBuffer);
-            }
-
-            // 跳过空音频数据
-            if (audioData.length === 0) {
-              console.debug("尝试发送空音频缓冲区，已跳过");
-              resolve(false);
-              return;
-            }       
-            
-            try {
-              // 将Float32Array转换为二进制数据
-              let encodedAudio = '';
-              const buffer = new ArrayBuffer(audioData.length * 4);
-              const view = new DataView(buffer);
-              
-              // 将每个float32值写入buffer
-              for (let i = 0; i < audioData.length; i++) {
-                view.setFloat32(i * 4, audioData[i], true); // true表示小端字节序
-              }
-              
-              // 将二进制数据转换为latin1编码的字符串
-              const bytes = new Uint8Array(buffer);
-              for (let i = 0; i < bytes.length; i++) {
-                encodedAudio += String.fromCharCode(bytes[i]);
-              }
-              
-              // 添加"AUDIO:"前缀
-              const message = `AUDIO:${encodedAudio}`;
-              
-              // 发送消息
-              console.log(`发送音频数据: ${audioData.length} 样本, 编码后大小: ${message.length} 字节, 估计时长: ${(audioData.length / AudioService.targetSampleRate).toFixed(2)}秒`);
-              this.socket.send(message);
-              resolve(true);
-            } catch (error) {
-              console.error('发送音频数据时出错:', error);
-              console.error('错误调用栈:', error.stack);
-              resolve(false);
-            }
-          };
-          reader.onerror = () => {
-            console.error('读取Blob数据失败');
-            resolve(false);
-          };
-          reader.readAsArrayBuffer(data);
-        });
-      } else if (typeof data === 'string') {
-        console.log(`发送文本消息: ${data}`);
+      // 如果是字符串，直接发送
+      if (typeof data === 'string') {
         this.socket.send(data);
-        return Promise.resolve(true);
-      } else {
-        console.error(`不支持的数据类型: ${typeof data}`);
-        return Promise.resolve(false);
+        console.log(`已发送文本消息: ${data}`);
+        return true;
       }
+      
+      // 如果是Blob或ArrayBuffer，直接发送
+      if (data instanceof Blob || data instanceof ArrayBuffer) {
+        this.socket.send(data);
+        console.log(`已发送二进制数据: ${data instanceof Blob ? data.size : data.byteLength} 字节`);
+        return true;
+      }
+      
+      // 如果是对象，转换为JSON字符串
+      if (typeof data === 'object') {
+        const jsonStr = JSON.stringify(data);
+        this.socket.send(jsonStr);
+        console.log(`已发送JSON数据: ${jsonStr}`);
+        return true;
+      }
+      
+      console.error('不支持的数据类型:', typeof data);
+      return false;
     } catch (error) {
-      console.error('发送数据时出错:', error);
-      return Promise.resolve(false);
+      console.error('发送数据失败:', error);
+      return false;
     }
   }
 
