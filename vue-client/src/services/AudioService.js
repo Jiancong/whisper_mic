@@ -75,25 +75,33 @@ class AudioService {
   // 添加处理静音的方法，匹配client.py中的逻辑
   handleSilence(isSilent) {
     const now = Date.now();
-
+    
     if (isSilent) {
+      // 如果是静音
       this.consecutiveSilenceBlocks++;
-
-      // 如果连续静音超过阈值，触发静音检测回调
-      if (this.consecutiveSilenceBlocks >= 3 && now - this.lastActiveTime > this.silenceDuration) {
-        console.log(`检测到持续静音: ${this.consecutiveSilenceBlocks} 块, ${(now - this.lastActiveTime) / 1000}秒`);
-
+      
+      // 检查是否已经超过静音持续时间
+      const silenceTime = now - this.lastActiveTime;
+      
+      if (silenceTime > this.silenceDuration && !this.paused) {
+        console.log(`检测到持续静音 ${silenceTime}ms，暂停处理`);
+        this.paused = true;
+        
+        // 触发静音检测回调
         if (this.callbacks.onSilenceDetected) {
           this.callbacks.onSilenceDetected();
         }
-
-        // 重置计数器
-        this.consecutiveSilenceBlocks = 0;
       }
     } else {
-      // 重置静音计数器和最后活动时间
+      // 如果不是静音，重置计数器和时间
       this.consecutiveSilenceBlocks = 0;
       this.lastActiveTime = now;
+      
+      // 如果之前是暂停状态，现在恢复
+      if (this.paused) {
+        console.log('检测到有效音频，恢复处理');
+        this.paused = false;
+      }
     }
   }
 
@@ -353,7 +361,7 @@ class AudioService {
 
   async startRecording() {
     if (this.isRecording) {
-      console.log('已经在录音中');
+      console.log('已经在录音中，返回');
       return;
     }
 
@@ -362,7 +370,7 @@ class AudioService {
       if (!this.audioContext || !this.audioStream) {
         const initialized = await this.initAudio();
         if (!initialized) {
-          throw new Error('无法初始化音频');
+          throw new Error('无法初始化音频，退出');
         }
       }
 
@@ -372,10 +380,12 @@ class AudioService {
       this.consecutiveSilenceBlocks = 0;
       this.lastActiveTime = Date.now();
       this.callbackCount = 0;
-
+      this.audioQueue = []; // 清空音频队列
 
       // 创建音频源
       const source = this.audioContext.createMediaStreamSource(this.audioStream);
+
+      console.log("創建音频源成功")
 
       // 使用ScriptProcessorNode处理音频
       this.audioProcessor = this.audioContext.createScriptProcessor(this.audioBufferSize, 1, 1);
@@ -384,7 +394,7 @@ class AudioService {
       // 处理音频数据
       this.audioProcessor.onaudioprocess = (e) => {
         if (!this.isRecording) {
-          console.log('录音已停止，不再处理音频数据');
+          console.log('录音已停止，不再处理音频数据，返回');
           return;
         }
 
@@ -392,13 +402,16 @@ class AudioService {
         // 增加回调计数
         this.callbackCount++;
 
-        const audioData = new Float32Array(inputData);
-        audioData.set(inputData);
+        // 复制数据，因为inputData是只读的
+        const audioData = new Float32Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          audioData[i] = inputData[i];
+        }
 
 
         // 计算音量
         const volume = this.calculateVolume(audioData);
-        console.log(`当前音量: ${volume.toFixed(6)}, 静音阈值: ${this.silenceThreshold}`);
+                console.log(`当前音量: ${volume.toFixed(6)}, 静音阈值: ${this.silenceThreshold}, 回调计数: ${this.callbackCount}`);
 
         if (this.callbacks.onVolumeChange) {
           this.callbacks.onVolumeChange(volume);
@@ -421,10 +434,22 @@ class AudioService {
           
           // 保存调试音频
           this.saveDebugAudio(processedData);
+
+          // 添加到音频队列
+          this.audioQueue.push(processedData);
+          this.accumulatedSamples += processedData.length;
+          
+          // 如果累积的样本数超过一定阈值，立即处理
+          if (this.accumulatedSamples >= this.targetSampleRate) { // 每秒处理一次
+            this._processAudioQueue();
+          }          
           
           // 触发音频数据回调
           if (this.callbacks.onAudioData) {
+            console.log(`发送音频数据到回调: ${processedData.length} 样本`);
             this.callbacks.onAudioData(processedData);
+          } else {
+            console.warn('onAudioData 回调未设置，无法发送音频数据');
           }
         }
       };

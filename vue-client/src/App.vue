@@ -198,13 +198,21 @@ export default {
       AudioService.setCallbacks({
         onAudioData: (audioData) => {
           try {
-            console.log(`音频回调触发: 收到 ${audioData ? audioData.length : 'undefined'} 样本的音频数据`);
+            console.log(`音频回调触发: 收到 ${audioData ? audioData.length : 'undefined'} 样本的音频数据, 类型: ${audioData ? typeof audioData : 'undefined'}, 是否数组: ${audioData ? Array.isArray(audioData) : false}`);
 
             // 检查音频数据是否有效
             if (!audioData || audioData.length === 0) {
-              console.warn('收到无效的音频数据');
+              console.warn('收到无效的音频数据，退出');
               return;
             }
+
+            // 检查是否正在录音且已连接
+            if (!isRecording.value || !isConnected.value) {
+              console.log('忽略音频数据: 未录音或未连接，退出');
+              return;
+            }
+
+            console.log("我們應該看到這裏！！！！！！！！！！！")
 
             if (isRecording.value && isConnected.value) {
               try {
@@ -214,7 +222,12 @@ export default {
                   try {
                     const stats = AudioService.logAudioStats(audioData);
                     if (stats && !stats.isSilent) {
-                      addLog('info', `音频统计: RMS=${stats.rms.toFixed(4)}, 最大值=${stats.max.toFixed(4)}, 最小值=${stats.min.toFixed(4)}`);
+                      console.log(`音频统计: RMS=${stats.rms.toFixed(4)}, 最大值=${stats.max.toFixed(4)}, 最小值=${stats.min.toFixed(4)}, 静音=${stats.isSilent}`);
+
+                      // 只有当音量足够大时才记录日志，避免日志过多
+                      if (stats.max > 0.05) {
+                        addLog('info', `音频统计: RMS=${stats.rms.toFixed(4)}, 最大值=${stats.max.toFixed(4)}`);
+                      }
                     }
                   } catch (statsError) {
                     console.error('记录音频统计信息失败:', statsError);
@@ -632,6 +645,7 @@ export default {
       isConnected,
       isRecording,
       transcription,
+      isPlayingServerAudio, // 添加这一行
       status,
       volume,
       logs,
