@@ -50,15 +50,7 @@
             {{ isRecording ? '停止录音' : '开始录音' }}
           </button>
         </div>
-        <!-- 添加服务器音频播放状态 -->
-        <div class="mb-6" v-if="isPlayingServerAudio">
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-gray-700 font-medium">服务器音频:</span>
-            <span class="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm font-medium animate-pulse">
-              正在播放服务器音频...
-            </span>
-          </div>
-        </div>
+
 
         <!-- 音量指示器 -->
         <div class="mt-4">
@@ -131,7 +123,6 @@ export default {
     const serverUrl = ref('ws://localhost:8765');
     const isConnected = ref(false);
     const isRecording = ref(false);
-    const isPlayingServerAudio = ref(false); // 添加新状态
     const transcription = ref('');
     const status = ref('');
     const volume = ref(0);
@@ -447,12 +438,11 @@ export default {
           addLog('info', `收到消息: ${message}`);
         },
         // 修改 onAudioData 回调处理，匹配client.py中的逻辑
-        onAudioData: (audioData, isServerAudio = false) => {
+        onAudioData: (audioData) => {
           try {
 
             // 如果是服务器发送的音频，直接播放，不需要检查录音状态
-            if (isServerAudio) {
-              isPlayingServerAudio.value = true;
+            
               console.log(`收到服务器音频数据: ${audioData.size} 字节`);
               addLog('info', `收到服务器音频数据: ${audioData.size} 字节，准备播放`);
 
@@ -476,7 +466,7 @@ export default {
 
                     // 播放完成时通知服务器
                     source.onended = () => {
-                      isPlayingServerAudio.value = false;
+                      
                       WebSocketService.send("playback_finished").then(() => {
                         console.log("playback_finished 播放服务端音频完毕");
                         addLog('info', "播放服务端音频完毕");
@@ -515,7 +505,7 @@ export default {
               };
               reader.readAsArrayBuffer(audioData);
               return;
-            }
+            
 
             console.log(`音频回调触发: 收到 ${audioData ? audioData.length : 'undefined'} 样本的音频数据`);
 
@@ -645,7 +635,6 @@ export default {
       isConnected,
       isRecording,
       transcription,
-      isPlayingServerAudio, // 添加这一行
       status,
       volume,
       logs,

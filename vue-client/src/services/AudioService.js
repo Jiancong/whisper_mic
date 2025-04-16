@@ -374,6 +374,10 @@ class AudioService {
         }
       }
 
+      // 如果音频上下文被挂起，恢复它
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume();
+      }
       // 重置状态
       this.isRecording = true;
       this.paused = false;
@@ -385,11 +389,15 @@ class AudioService {
       // 创建音频源
       const source = this.audioContext.createMediaStreamSource(this.audioStream);
 
-      console.log("創建音频源成功")
+      // 创建脚本处理器节点，确保缓冲区大小是有效的
+      const bufferSize = 4096; // 使用较小的缓冲区大小，提高响应速度
+      console.log(`创建ScriptProcessor节点，缓冲区大小: ${bufferSize}`);
 
       // 使用ScriptProcessorNode处理音频
       this.audioProcessor = this.audioContext.createScriptProcessor(this.audioBufferSize, 1, 1);
 
+      // 添加调试日志
+      console.log('音频处理器创建完成，设置onaudioprocess事件处理器');
 
       // 处理音频数据
       this.audioProcessor.onaudioprocess = (e) => {
@@ -403,15 +411,14 @@ class AudioService {
         this.callbackCount++;
 
         // 复制数据，因为inputData是只读的
-        const audioData = new Float32Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          audioData[i] = inputData[i];
-        }
+        const audioData = new Float32Array(inputData);
 
+        // 添加调试日志，确认音频处理器正在接收数据
+        console.log(`接收到音频数据: ${audioData.length} 样本`);
 
         // 计算音量
         const volume = this.calculateVolume(audioData);
-                console.log(`当前音量: ${volume.toFixed(6)}, 静音阈值: ${this.silenceThreshold}, 回调计数: ${this.callbackCount}`);
+        console.log(`当前音量: ${volume.toFixed(6)}, 静音阈值: ${this.silenceThreshold}`);
 
         if (this.callbacks.onVolumeChange) {
           this.callbacks.onVolumeChange(volume);
@@ -457,8 +464,11 @@ class AudioService {
       // 连接节点
       source.connect(this.audioProcessor);
       this.audioProcessor.connect(this.audioContext.destination);
-      
-      console.log('开始录音，采样率:', this.actualSampleRate, '目标采样率:', this.targetSampleRate);
+
+      // 启动音频处理
+      this.startAudioProcessing();
+
+      console.log('录音已开始，音频处理器已设置');
       return true;
     } catch (error) {
       console.error('开始录音失败:', error);
