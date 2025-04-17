@@ -252,10 +252,12 @@ async def handle_user_refuse_current_question(
     # 将用户拒绝回答的信息添加到对话历史
     conversation_history.append({"role": "user", "content": transcription})
     
-    # 更新面试记录中的回答
+    # 更新面试记录中的回答，包含回答时间
     current_qa_index = current_question_id - 1
     if 0 <= current_qa_index < len(interview_data["qa_pairs"]):
+        answer_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         interview_data["qa_pairs"][current_qa_index]["answer"] = transcription
+        interview_data["qa_pairs"][current_qa_index]["answer_time"] = answer_time  # 添加回答时间
         interview_data["qa_pairs"][current_qa_index]["answer_complete"] = True
         interview_data["qa_pairs"][current_qa_index]["user_skipped"] = True
     
@@ -370,10 +372,13 @@ async def process_audio(websocket, path):
             return
 
         # 记录第一个问题到面试记录
+        question_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         interview_data["qa_pairs"].append({
             "question_id": 1,
             "question": current_question,
+            "question_time": question_time,  # 添加问题时间
             "answer": "",
+            "answer_time": "",  # 初始化回答时间
             "answer_complete": False
         })            
 
@@ -429,8 +434,12 @@ async def process_audio(websocket, path):
                                     # 更新面试记录中的回答
                                     current_qa_index = current_question_id - 1
                                     if 0 <= current_qa_index < len(interview_data["qa_pairs"]):
+                                        answer_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                         interview_data["qa_pairs"][current_qa_index]["answer"] = transcription
+                                        interview_data["qa_pairs"][current_qa_index]["answer_time"] = answer_time  # 添加回答时间
                                         interview_data["qa_pairs"][current_qa_index]["answer_complete"] = True
+                                        # 记录日志，确认回答已被记录
+                                        logger.info(f"已记录问题 {current_question_id} 的回答: {transcription[:50]}...")
                             
                             # 重置连续静音计数和更多细节标志
                             consecutive_silence_count = 0
@@ -451,11 +460,14 @@ async def process_audio(websocket, path):
                                     current_question = next_question
                                     current_question_id = question_counter  # 更新当前问题ID
 
-                                    # 添加到面试记录
+                                    question_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    # 添加到面试记录，包含问题时间
                                     interview_data["qa_pairs"].append({
                                         "question_id": question_counter,
                                         "question": next_question,
+                                        "question_time": question_time,  # 添加问题时间
                                         "answer": "",
+                                        "answer_time": "",  # 初始化回答时间
                                         "answer_complete": False
                                     })                                    
                                     
@@ -517,7 +529,10 @@ async def process_audio(websocket, path):
                         if transcription and len(transcription) > 0:
                             logger.info(f"最终转录结果: {transcription}")
                             await websocket.send(f"TRANSCRIPTION: {transcription}")
-                            
+
+                            # 将用户回答添加到对话历史
+                            conversation_history.append({"role": "user", "content": transcription})
+                           
                             # 分析用户回答状态
                             response_status, explanation = await tts_processor.analyze_user_response(
                                 transcription, 
@@ -553,7 +568,9 @@ async def process_audio(websocket, path):
                                 # 更新面试记录中的回答
                                 current_qa_index = current_question_id - 1
                                 if 0 <= current_qa_index < len(interview_data["qa_pairs"]):
+                                    answer_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                     interview_data["qa_pairs"][current_qa_index]["answer"] = transcription
+                                    interview_data["qa_pairs"][current_qa_index]["answer_time"] = answer_time  # 添加回答时间
                                     interview_data["qa_pairs"][current_qa_index]["answer_complete"] = True                                
 
                                 # 重置连续静音计数和更多细节标志
@@ -574,6 +591,18 @@ async def process_audio(websocket, path):
                                         conversation_history.append({"role": "assistant", "content": next_question})
                                         current_question = next_question
                                         current_question_id = question_counter  # 更新当前问题ID
+
+                                        # 添加到面试记录，包含问题时间
+                                        question_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        interview_data["qa_pairs"].append({
+                                            "question_id": question_counter,
+                                            "question": next_question,
+                                            "question_time": question_time,  # 添加问题时间
+                                            "answer": "",
+                                            "answer_time": "",  # 初始化回答时间
+                                            "answer_complete": False,
+                                            "user_skipped": False  # 初始化用户是否跳过问题
+                                        })                                        
                                         
                                         # 生成TTS音频
                                         next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
@@ -597,6 +626,15 @@ async def process_audio(websocket, path):
                                 else:
                                     logger.info("已达到最大问题数量，结束面试")
                                     await websocket.send("All questions have been asked. Thank you for the interview!")
+
+                                    # 检查面试记录完整性
+                                    logger.info(f"面试记录包含 {len(interview_data['qa_pairs'])} 个问答对")
+                                    for i, qa in enumerate(interview_data["qa_pairs"]):
+                                        logger.info(f"问题 {i+1}: {qa['question'][:50]}...")
+                                        if qa.get("answer"):
+                                            logger.info(f"回答: {qa['answer'][:50]}...")
+                                        else:
+                                            logger.warning(f"问题 {i+1} 没有回答记录")
 
                                     # 生成面试报告
                                     logger.info("开始生成面试报告...")

@@ -37,10 +37,28 @@ class InterviewReportGenerator:
             # 准备问答记录的格式化文本，用于报告
             qa_formatted = ""
             for i, qa in enumerate(interview_data["qa_pairs"]):
-                if qa["answer"]:  # 只包含有回答的问题
-                    qa_formatted += f"\n问题 {i+1}: {qa['question']}\n"
+                # 添加问题和时间信息
+                question_time = qa.get("question_time", "未记录")
+                qa_formatted += f"\n问题 {i+1}: {qa['question']}\n"
+                qa_formatted += f"提问时间: {question_time}\n"
+                
+                # 添加回答和时间信息（如果有回答）
+                if qa.get("answer"):
+                    answer_time = qa.get("answer_time", "未记录")
                     qa_formatted += f"面试者回答: {qa['answer']}\n"
-                    qa_formatted += "-" * 50 + "\n"
+                    qa_formatted += f"回答时间: {answer_time}\n"
+                    
+                    # 添加回答完成状态
+                    answer_status = "已完成" if qa.get("answer_complete", False) else "未完成"
+                    qa_formatted += f"回答状态: {answer_status}\n"
+                    
+                    # 添加用户是否跳过问题的信息
+                    if qa.get("user_skipped", False):
+                        qa_formatted += "注: 面试者选择跳过此问题\n"
+                else:
+                    qa_formatted += "面试者回答: 未回答\n"
+                
+                qa_formatted += "-" * 50 + "\n"
             
             # 生成面试报告
             report_prompt = [
@@ -50,6 +68,8 @@ class InterviewReportGenerator:
 
 候选人背景：
 {candidate_info}
+
+面试时间：{interview_data["interview_time"]}
 
 面试问答记录：
 {qa_formatted}
@@ -90,6 +110,7 @@ class InterviewReportGenerator:
 2. 每个评估部分需要有明确的标题和分数
 3. 在每个问题分析部分，必须先引用原始问题和回答，再进行评分和分析
 4. 总分需要精确到小数点后一位
+5. 报告中必须包含完整的面试问答记录，包括问题、回答和相应的时间信息
 """}
             ]
             
@@ -111,4 +132,7 @@ class InterviewReportGenerator:
             
         except Exception as e:
             logger.error(f"生成面试报告时出错: {e}")
+            logger.error(f"错误详情: {str(e)}")
+            import traceback
+            logger.error(f"错误堆栈: {traceback.format_exc()}")
             return None, None
