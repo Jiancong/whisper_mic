@@ -43,6 +43,8 @@ SILENCE_THRESHOLD = 0.0005  # 静音检测阈值，降低以捕获更多音频
 QUESTIONS_CHECK_INTERVAL = 2  # 检查问题生成状态的间隔（秒）
 MAX_WAIT_TIME = 300  # 最长等待问题生成的时间（秒）
 
+MAX_INVALID_ATTEMPTS = 2  # 最大无效回答尝试次数
+
 # Predefined audio file paths
 QUESTION_1_FILE = os.path.join(TTS_PREDEFINED_AUDIO_DIR, INTERVIEWER_NAME, "question_1.wav")
 MORE_DETAILS_FILE = os.path.join(TTS_PREDEFINED_AUDIO_DIR, INTERVIEWER_NAME, "more_details.wav")
@@ -356,6 +358,9 @@ async def process_audio(websocket, path):
     more_details_sent = False  # 是否已发送更多细节提示
     current_question_id = 1  # 当前问题ID，用于跟踪问题变化
 
+    # 初始化变量
+    invalid_answer_count = 0  # 跟踪当前问题的无效回答次数
+
     try:
         # Check if predefined audio directory and files exist
         if not os.path.exists(QUESTION_1_FILE):
@@ -542,11 +547,97 @@ async def process_audio(websocket, path):
                             
                             logger.info(f"用户回答状态: {response_status} - {explanation}")
                             
-                            # 根据回答状态采取不同行动
+
+                            # 修改处理用户回答状态为1的情况
                             if response_status == 1:  # 用户没有回答问题
                                 logger.info("用户没有回答问题，重新提问")
-                                await websocket.send("STATUS: 请回答当前问题")
-                                # 可以选择重新播放问题
+                                
+                                # 增加无效回答计数
+                                invalid_answer_count += 1
+                                logger.info(f"当前问题无效回答次数: {invalid_answer_count}/{MAX_INVALID_ATTEMPTS}")
+                                
+                                if invalid_answer_count >= MAX_INVALID_ATTEMPTS:
+                                    # 达到最大无效回答次数，强制进入下一个问题
+                                    logger.info(f"已达到最大无效回答次数({MAX_INVALID_ATTEMPTS})，强制进入下一个问题")
+                                    
+                                    # 将无效回答添加到对话历史和面试记录
+                                    conversation_history.append({"role": "user", "content": transcription})
+                                    
+                                    # 更新面试记录中的回答
+                                    current_qa_index = current_question_id - 1
+                                    if 0 <= current_qa_index < len(interview_data["qa_pairs"]):
+                                        answer_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        interview_data["qa_pairs"][current_qa_index]["answer"] = transcription
+                                        interview_data["qa_pairs"][current_qa_index]["answer_time"] = answer_time
+                                        interview_data["qa_pairs"][current_qa_index]["answer_complete"] = False
+                                        interview_data["qa_pairs"][current_qa_index]["invalid_answer"] = True
+                                    
+                                    # 重置无效回答计数
+                                    invalid_answer_count = 0
+                                    
+                                    # 生成下一个问题
+                                    if question_counter <= MAX_QUESTIONS:
+                                        logger.info("强制生成下一个问题...")
+                                        
+                                        # 生成下一个问题
+                                        next_question = chat_with_ollama(conversation_history)
+                                        
+                                        if next_question:
+                                            logger.info(f"生成的下一个问题: {next_question}")
+                                            
+                                            # 添加到对话历史
+                                            conversation_history.append({"role": "assistant", "content": next_question})
+                                            current_question = next_question
+                                            current_question_id = question_counter  # 更新当前问题ID
+                                            
+                                            # 添加到面试记录
+                                            question_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                            interview_data["qa_pairs"].append({
+                                                "question_id": question_counter,
+                                                "question": next_question,
+                                                "question_time": question_time,
+                                                "answer": "",
+                                                "answer_time": "",
+                                                "answer_complete": False,
+                                                "user_skipped": False,
+                                                "invalid_answer": False
+                                            })
+                                            
+                                            # 生成TTS音频
+                                            next_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{question_counter}.wav")
+                                            success = await tts_processor.generate_tts(next_question, next_audio_path)
+                                            
+                                            if success:
+                                                logger.info(f"已生成问题音频: {next_audio_path}")
+                                                await tts_processor.send_audio(websocket, next_audio_path)
+                                                logger.info(f"已发送下一个问题: {next_question}")
+                                                
+                                                awaiting_response = True
+                                                question_counter += 1
+                                                # 清空音频缓冲区，准备接收下一个回答
+                                                audio_buffer = np.array([], dtype=np.float32)
+                                            else:
+                                                logger.error("TTS生成失败，使用预定义的更多细节音频")
+                                                await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                        else:
+                                            logger.error("问题生成失败，使用预定义的更多细节音频")
+                                            await tts_processor.send_audio(websocket, MORE_DETAILS_FILE)
+                                    else:
+                                        logger.info("已达到最大问题数量，结束面试")
+                                        await websocket.send("All questions have been asked. Thank you for the interview!")
+                                        # 播放结束音频
+                                        await tts_processor.send_audio(websocket, BYE_FILE)
+                                        break
+                                else:
+                                    # 未达到最大无效回答次数，提示用户重新回答
+                                    await websocket.send("STATUS: 请回答当前问题")
+                                    # 可以选择重新播放问题
+                                    current_question_audio_path = os.path.join(TTS_AUDIO_DIR, f"question_{current_question_id}.wav")
+                                    if os.path.exists(current_question_audio_path):
+                                        logger.info(f"重新播放当前问题: {current_question}")
+                                        await tts_processor.send_audio(websocket, current_question_audio_path)
+                                    else:
+                                        logger.error(f"当前问题音频文件不存在: {current_question_audio_path}")
                                 
                             elif response_status == 2:  # 用户正在思考，回答未结束
                                 logger.info("用户回答未结束，发送更多细节提示")
