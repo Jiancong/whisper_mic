@@ -46,3 +46,8 @@ python app.py
 ```
 
 
+## For browser version
+Goes into the vue-client folder, run
+
+npm run dev
+
